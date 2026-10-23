@@ -43,3 +43,6 @@ next-env.d.ts
 
 # local demo database (PGlite)
 /.data/
+
+# netlify local build output
+.netlify
