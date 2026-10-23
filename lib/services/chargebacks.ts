@@ -1,21 +1,8 @@
 import "server-only";
-import { and, eq, gte, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
-import type { DbOrTx } from "@/lib/db";
-import {
-  brandLegalEntities,
-  chargebackCases,
-  chargebackEvents,
-  legalEntities,
-  rolePermissions,
-  systemSettings,
-  transactions,
-  userBrandAccess,
-  userLegalEntityAccess,
-  userRoles,
-  users,
-} from "@/lib/db/schema";
-import { nextCaseId, nextId } from "@/lib/db/ids";
+import { getDb, type InsertOf } from "@/lib/db";
+import { ids } from "@/lib/db/query";
+import { nextCaseId, nextId, nextSequence } from "@/lib/db/ids";
 import { BusinessRuleError } from "@/lib/actions";
 import { logActivity, notify } from "@/lib/audit";
 import { can, canAccessBrand, canAccessEntity, canTransactInBrand, type Viewer } from "@/lib/auth/viewer";
@@ -30,8 +17,9 @@ import type { Permission } from "@/lib/domain/permissions";
 
 export type ChargebackPolicy = WorkflowPolicy & { allowPartial: boolean; allowMultiple: boolean; maxDaysAfterPayment: number };
 
-export async function readPolicy(db: DbOrTx): Promise<ChargebackPolicy> {
-  const rows = await db.select().from(systemSettings).where(sql`${systemSettings.key} like 'chargeback.%'`);
+export async function readPolicy(): Promise<ChargebackPolicy> {
+  const C = await getDb();
+  const rows = await C.systemSettings.find({ key: /^chargeback\./ }).toArray();
   const get = <T,>(key: string, fallback: T): T => {
     const v = rows.find((r) => r.key === key)?.value;
     return v === undefined || v === null ? fallback : (v as T);
@@ -54,38 +42,27 @@ type CaseType = "chargeback" | "intercompany_recharge";
  * configurable brand→LLC mapping (scope chargeback|all, effective on the
  * request date, entity active and permitted to book this type).
  */
-export async function eligibleResponsibleEntities(db: DbOrTx, brandId: string, caseType: CaseType, originalEntityId: string, at: Date) {
+export async function eligibleResponsibleEntities(brandId: string, caseType: CaseType, originalEntityId: string, at: Date) {
+  const C = await getDb();
   const day = at.toISOString().slice(0, 10);
   const requiredType = caseType === "chargeback" ? "chargeback" : "intercompany_recharge";
-  const mapped = await db
-    .select({
-      id: legalEntities.id,
-      registeredName: legalEntities.registeredName,
-      internalCode: legalEntities.internalCode,
-      status: legalEntities.status,
-      permitted: legalEntities.permittedTransactionTypes,
-      isDefault: brandLegalEntities.isDefault,
-    })
-    .from(brandLegalEntities)
-    .innerJoin(legalEntities, eq(legalEntities.id, brandLegalEntities.legalEntityId))
-    .where(
-      and(
-        eq(brandLegalEntities.brandId, brandId),
-        inArray(brandLegalEntities.scope, ["chargeback", "all"]),
-        lte(brandLegalEntities.effectiveFrom, day),
-        or(isNull(brandLegalEntities.effectiveTo), gte(brandLegalEntities.effectiveTo, day)),
-      ),
-    );
-  const [orig] = await db
-    .select({
-      id: legalEntities.id,
-      registeredName: legalEntities.registeredName,
-      internalCode: legalEntities.internalCode,
-      status: legalEntities.status,
-      permitted: legalEntities.permittedTransactionTypes,
-    })
-    .from(legalEntities)
-    .where(eq(legalEntities.id, originalEntityId));
+  const maps = await C.brandLegalEntities
+    .find({ brandId, scope: { $in: ["chargeback", "all"] }, effectiveFrom: { $lte: day }, $or: [{ effectiveTo: null }, { effectiveTo: { $gte: day } }] })
+    .toArray();
+  const entities = await C.legalEntities.find({ id: { $in: ids([...maps.map((m) => m.legalEntityId), originalEntityId]) } }).toArray();
+  const asRow = (e: (typeof entities)[number]) => ({
+    id: e.id,
+    registeredName: e.registeredName,
+    internalCode: e.internalCode,
+    status: e.status,
+    permitted: e.permittedTransactionTypes,
+  });
+  const mapped = maps.flatMap((m) => {
+    const e = entities.find((x) => x.id === m.legalEntityId);
+    return e ? [{ ...asRow(e), isDefault: m.isDefault }] : [];
+  });
+  const origDoc = entities.find((e) => e.id === originalEntityId);
+  const orig = origDoc ? asRow(origDoc) : undefined;
 
   const byId = new Map<string, { id: string; registeredName: string; internalCode: string; isDefault: boolean; isOriginal: boolean }>();
   const ok = (e: { status: string; permitted: string[] }) => e.status === "active" && e.permitted.includes(requiredType);
@@ -146,9 +123,9 @@ export const caseInputSchema = z
 export type CaseInput = z.input<typeof caseInputSchema>;
 
 /** Validates a case against the original payment and configured business rules. */
-async function validateAgainstOriginal(tx: DbOrTx, viewer: Viewer, input: z.output<typeof caseInputSchema>, policy: ChargebackPolicy, excludeCaseId?: string, previousResponsible?: string) {
+async function validateAgainstOriginal(viewer: Viewer, input: z.output<typeof caseInputSchema>, policy: ChargebackPolicy, excludeCaseId?: string, previousResponsible?: string) {
   if (!canTransactInBrand(viewer, input.brandId)) throw new BusinessRuleError("This brand is inactive or you are not authorised for it.", { brandId: ["Select an active brand you are assigned to."] });
-  const orig = await getOriginalTransaction(viewer, input.originalTransactionId, tx);
+  const orig = await getOriginalTransaction(viewer, input.originalTransactionId);
   if (!orig) throw new BusinessRuleError("Original transaction not found or not accessible to you.", { originalTransactionId: ["Not found in your scope."] });
   if (orig.status !== "succeeded") throw new BusinessRuleError("Only succeeded payments can be charged back.");
   if (orig.brandId !== input.brandId)
@@ -167,7 +144,7 @@ async function validateAgainstOriginal(tx: DbOrTx, viewer: Viewer, input: z.outp
   if (input.caseType === "intercompany_recharge" && !(can(viewer, "transactions.view") && canAssignEntity(viewer)))
     throw new BusinessRuleError("Intercompany recharges can only be raised by a Super Admin.");
 
-  const eligible = await eligibleResponsibleEntities(tx, input.brandId, input.caseType, orig.legalEntityId, requestDate);
+  const eligible = await eligibleResponsibleEntities(input.brandId, input.caseType, orig.legalEntityId, requestDate);
   const chosen = eligible.find((e) => e.id === input.responsibleLegalEntityId);
   if (!chosen)
     throw new BusinessRuleError("The selected legal entity is not configured to handle this type of case for this brand.", {
@@ -179,7 +156,9 @@ async function validateAgainstOriginal(tx: DbOrTx, viewer: Viewer, input: z.outp
   if (!canAccessEntity(viewer, input.responsibleLegalEntityId) && !canAccessEntity(viewer, orig.legalEntityId))
     throw new BusinessRuleError("You do not have access to these legal entities.");
 
-  const balance = (await chargeableBalance(tx, orig.id, input.caseType, excludeCaseId))!;
+  // Serialise concurrent requests on the same payment (write-conflict lock), then check the cap.
+  await lockOriginal(orig.id);
+  const balance = (await chargeableBalance(orig.id, input.caseType, excludeCaseId))!;
   const amount = toCents(input.amount);
   if (amount <= 0) throw new BusinessRuleError("Amount must be greater than zero.", { amount: ["Must be greater than zero."] });
   if (!policy.allowMultiple && balance.activeCases > 0)
@@ -201,44 +180,46 @@ export function defaultResponsible(eligible: { id: string; isDefault: boolean; i
 
 /* ----------------------------------------------------------- recipients */
 
-async function usersWithPermission(db: DbOrTx, perm: Permission, brandId: string, exclude: string[] = []) {
-  const rows = await db
-    .selectDistinct({ id: users.id })
-    .from(users)
-    .innerJoin(userRoles, eq(userRoles.userId, users.id))
-    .innerJoin(rolePermissions, eq(rolePermissions.roleId, userRoles.roleId))
-    .innerJoin(userBrandAccess, and(eq(userBrandAccess.userId, users.id), eq(userBrandAccess.brandId, brandId)))
-    .where(and(eq(rolePermissions.permissionKey, perm), eq(users.status, "active"), exclude.length ? notInArray(users.id, exclude) : undefined));
-  return rows.map((r) => r.id);
+async function usersWithPermission(perm: Permission, brandId: string, exclude: string[] = []) {
+  const C = await getDb();
+  const roleIds = await C.rolePermissions.distinct("roleId", { permissionKey: perm });
+  const withRole = await C.userRoles.distinct("userId", { roleId: { $in: ids(roleIds) } });
+  const withBrand = await C.userBrandAccess.distinct("userId", { brandId, userId: { $in: ids(withRole) } });
+  return C.users.distinct("id", { id: { $in: ids(withBrand), $nin: exclude }, status: "active" });
 }
 
 /** Restrict finance recipients to those who can see one of the case's entities. */
-async function filterByEntityAccess(db: DbOrTx, userIds: string[], entityIds: string[]) {
+async function filterByEntityAccess(userIds: string[], entityIds: string[]) {
   if (!userIds.length) return [];
-  const allAccess = await db
-    .selectDistinct({ id: userRoles.userId })
-    .from(userRoles)
-    .innerJoin(rolePermissions, eq(rolePermissions.roleId, userRoles.roleId))
-    .where(and(inArray(userRoles.userId, userIds), eq(rolePermissions.permissionKey, "entities.all_access")));
-  const scoped = await db
-    .selectDistinct({ id: userLegalEntityAccess.userId })
-    .from(userLegalEntityAccess)
-    .where(and(inArray(userLegalEntityAccess.userId, userIds), inArray(userLegalEntityAccess.legalEntityId, entityIds)));
-  const ok = new Set([...allAccess, ...scoped].map((r) => r.id));
+  const C = await getDb();
+  const allRoles = await C.rolePermissions.distinct("roleId", { permissionKey: "entities.all_access" });
+  const allAccess = await C.userRoles.distinct("userId", { userId: { $in: userIds }, roleId: { $in: ids(allRoles) } });
+  const scoped = await C.userLegalEntityAccess.distinct("userId", { userId: { $in: userIds }, legalEntityId: { $in: ids(entityIds) } });
+  const ok = new Set([...allAccess, ...scoped]);
   return userIds.filter((u) => ok.has(u));
+}
+
+/**
+ * Concurrency guard for the chargeable balance: every transaction that checks
+ * or consumes the balance of a payment first writes the same lock document, so
+ * concurrent ones conflict and are retried (and then see each other's cases).
+ */
+async function lockOriginal(originalTxnId: string) {
+  await nextSequence(`lock:chargeback:${originalTxnId}`);
 }
 
 /* ----------------------------------------------------------- operations */
 
-export async function createCase(tx: DbOrTx, viewer: Viewer, raw: CaseInput, submit: boolean) {
+export async function createCase(viewer: Viewer, raw: CaseInput, submit: boolean) {
   if (!can(viewer, "chargebacks.create")) throw new BusinessRuleError("You do not have permission to raise recharge / chargeback requests.");
   const input = caseInputSchema.parse(raw);
-  const policy = await readPolicy(tx);
-  const { orig, requestDate, amount } = await validateAgainstOriginal(tx, viewer, input, policy);
+  const C = await getDb();
+  const policy = await readPolicy();
+  const { orig, requestDate, amount } = await validateAgainstOriginal(viewer, input, policy);
 
-  const id = await nextCaseId(tx, requestDate);
+  const id = await nextCaseId(requestDate);
   const now = new Date();
-  await tx.insert(chargebackCases).values({
+  await C.chargebackCases.insertOne({
     id,
     caseType: input.caseType,
     origin: input.origin,
@@ -260,7 +241,7 @@ export async function createCase(tx: DbOrTx, viewer: Viewer, raw: CaseInput, sub
     createdAt: now,
     updatedAt: now,
   });
-  await tx.insert(chargebackEvents).values({
+  await C.chargebackEvents.insertOne({
     caseId: id,
     action: "created",
     toStatus: "draft",
@@ -272,7 +253,7 @@ export async function createCase(tx: DbOrTx, viewer: Viewer, raw: CaseInput, sub
       responsibleLegalEntityId: input.responsibleLegalEntityId,
     },
   });
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: "chargeback.created",
     entityType: "chargeback",
@@ -289,20 +270,21 @@ export async function createCase(tx: DbOrTx, viewer: Viewer, raw: CaseInput, sub
       entityOverride: input.responsibleLegalEntityId !== orig.legalEntityId,
     },
   });
-  if (submit) await transition(tx, viewer, id, "submit", "");
+  if (submit) await transition(viewer, id, "submit", "");
   return id;
 }
 
-export async function updateDraft(tx: DbOrTx, viewer: Viewer, id: string, raw: CaseInput) {
-  const [c] = await tx.select().from(chargebackCases).where(eq(chargebackCases.id, id));
+export async function updateDraft(viewer: Viewer, id: string, raw: CaseInput) {
+  const C = await getDb();
+  const c = await C.chargebackCases.findOne({ id });
   if (!c) throw new BusinessRuleError("Case not found.");
-  const policy = await readPolicy(tx);
+  const policy = await readPolicy();
   const check = evaluate("edit", viewer, c, policy);
   if (!check.allowed) throw new BusinessRuleError(check.reason!);
   const input = caseInputSchema.parse(raw);
   if (input.originalTransactionId !== c.originalTransactionId || input.brandId !== c.brandId || input.caseType !== c.caseType)
     throw new BusinessRuleError("Brand, case type and original transaction cannot change — cancel and raise a new request instead.");
-  const { amount, requestDate } = await validateAgainstOriginal(tx, viewer, input, policy, id, c.responsibleLegalEntityId);
+  const { amount, requestDate } = await validateAgainstOriginal(viewer, input, policy, id, c.responsibleLegalEntityId);
 
   const next = {
     amount: fromCents(amount),
@@ -322,9 +304,9 @@ export async function updateDraft(tx: DbOrTx, viewer: Viewer, id: string, raw: C
     if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) changes[k] = { from: a, to: b };
   }
   if (!Object.keys(changes).length) return { changed: false };
-  await tx.update(chargebackCases).set({ ...next, updatedAt: new Date() }).where(eq(chargebackCases.id, id));
-  await tx.insert(chargebackEvents).values({ caseId: id, action: "edited", fromStatus: "draft", toStatus: "draft", actorId: viewer.id, changes });
-  await logActivity(tx, {
+  await C.chargebackCases.updateOne({ id }, { $set: { ...next, updatedAt: new Date() } });
+  await C.chargebackEvents.insertOne({ caseId: id, action: "edited", fromStatus: "draft", toStatus: "draft", actorId: viewer.id, changes });
+  await logActivity({
     actorId: viewer.id,
     action: "chargeback.updated",
     entityType: "chargeback",
@@ -339,17 +321,19 @@ export async function updateDraft(tx: DbOrTx, viewer: Viewer, id: string, raw: C
 
 export type TransitionExtra = { processorReference?: string; outcomeDate?: string };
 
-export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action: WorkflowAction, note: string, extra: TransitionExtra = {}) {
-  // Row lock so two approvers can't act on the same case concurrently.
-  const locked = await tx.execute(sql`select id from chargeback_cases where id = ${id} for update`);
-  if (!locked.rows.length) throw new BusinessRuleError("Case not found.");
-  const [c] = await tx.select().from(chargebackCases).where(eq(chargebackCases.id, id));
+export async function transition(viewer: Viewer, id: string, action: WorkflowAction, note: string, extra: TransitionExtra = {}) {
+  const C = await getDb();
+  // Write first, so two approvers acting on the same case concurrently conflict
+  // (one transaction is retried and then sees the other's change).
+  const touched = await C.chargebackCases.updateOne({ id }, { $set: { updatedAt: new Date() } });
+  if (!touched.matchedCount) throw new BusinessRuleError("Case not found.");
+  const c = (await C.chargebackCases.findOne({ id }))!;
   if (!canAccessBrand(viewer, c.brandId)) throw new BusinessRuleError("You are not authorised for this brand.");
   if (!canAccessEntity(viewer, c.originalLegalEntityId) && !canAccessEntity(viewer, c.responsibleLegalEntityId))
     throw new BusinessRuleError("You do not have access to this case's legal entities.");
   if (!can(viewer, "chargebacks.view_all") && c.requestedBy !== viewer.id) throw new BusinessRuleError("Case not accessible.");
 
-  const policy = await readPolicy(tx);
+  const policy = await readPolicy();
   const check = evaluate(action, viewer, c, policy);
   if (!check.allowed) throw new BusinessRuleError(check.reason ?? "Action not allowed.");
   const trimmed = note.trim().slice(0, 2000);
@@ -358,13 +342,14 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
   const now = new Date();
   const from = c.status as CaseStatus;
   const to = (check.to ?? from) as CaseStatus;
-  const patch: Partial<typeof chargebackCases.$inferInsert> = { status: to, updatedAt: now };
+  const patch: Partial<InsertOf<"chargebackCases">> = { status: to, updatedAt: now };
   let ledgerId: string | null = null;
 
   switch (action) {
     case "submit": {
       // Re-validate the cumulative cap at submission — other cases may have been raised meanwhile.
-      const bal = (await chargeableBalance(tx, c.originalTransactionId, c.caseType, c.id))!;
+      await lockOriginal(c.originalTransactionId);
+      const bal = (await chargeableBalance(c.originalTransactionId, c.caseType, c.id))!;
       if (toCents(c.amount) > bal.remaining)
         throw new BusinessRuleError(`Amount now exceeds the chargeable balance (${fromCents(bal.remaining)} ${c.currency}). Edit the draft first.`);
       break;
@@ -395,23 +380,24 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
       Object.assign(patch, { outcomeNote: trimmed });
       break;
     case "complete": {
-      const [orig] = await tx.select().from(transactions).where(eq(transactions.id, c.originalTransactionId));
+      const orig = await C.transactions.findOne({ id: c.originalTransactionId });
       // Cap is re-checked against *completed + other active* cases at the moment money moves.
-      const bal = (await chargeableBalance(tx, c.originalTransactionId, c.caseType, c.id))!;
+      await lockOriginal(c.originalTransactionId);
+      const bal = (await chargeableBalance(c.originalTransactionId, c.caseType, c.id))!;
       if (toCents(c.amount) > bal.remaining) throw new BusinessRuleError("Completing this case would exceed the original transaction amount.");
       const ref = extra.processorReference?.trim() || null;
       if (ref && !/^[A-Za-z0-9_\-.:]{4,80}$/.test(ref)) throw new BusinessRuleError("Processor reference has an invalid format.");
       if (ref) {
-        const [dupe] = await tx.select({ id: transactions.id }).from(transactions).where(eq(transactions.paymentReference, ref));
+        const dupe = await C.transactions.findOne({ paymentReference: ref }, { projection: { id: 1 } });
         if (dupe) throw new BusinessRuleError(`Processor reference already recorded on ${dupe.id}.`);
       }
       const occurredAt = extra.outcomeDate ? new Date(`${extra.outcomeDate}T12:00:00Z`) : now;
       if (occurredAt.getTime() > now.getTime() + 86_400_000) throw new BusinessRuleError("Outcome date cannot be in the future.");
-      ledgerId = await nextId(tx, "transaction");
+      ledgerId = await nextId("transaction");
       if (c.caseType === "chargeback") {
         // Booked against the ORIGINAL entity. A different responsible entity handles the case but does
         // not silently absorb the loss — that needs a separate, approved intercompany recharge.
-        await tx.insert(transactions).values({
+        await C.transactions.insertOne({
           id: ledgerId,
           type: "chargeback",
           status: "succeeded",
@@ -433,7 +419,7 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
           createdBy: viewer.id,
         });
       } else {
-        await tx.insert(transactions).values({
+        await C.transactions.insertOne({
           id: ledgerId,
           type: "intercompany_recharge",
           status: "succeeded",
@@ -456,9 +442,9 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
     }
   }
 
-  if (check.to) await tx.update(chargebackCases).set(patch).where(eq(chargebackCases.id, id));
-  else await tx.update(chargebackCases).set({ updatedAt: now }).where(eq(chargebackCases.id, id));
-  await tx.insert(chargebackEvents).values({
+  if (check.to) await C.chargebackCases.updateOne({ id }, { $set: patch });
+  else await C.chargebackCases.updateOne({ id }, { $set: { updatedAt: now } });
+  await C.chargebackEvents.insertOne({
     caseId: id,
     action: action === "note" ? "note" : action === "forward" ? "reviewed" : action === "complete" ? "completed" : action === "fail" ? "failed" : action === "approve" ? "approved" : action === "reject" ? "rejected" : action === "cancel" ? "cancelled" : action === "return" ? "returned" : action === "submit" ? "submitted" : action === "start_processing" ? "processing_started" : action,
     fromStatus: from,
@@ -467,7 +453,7 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
     note: trimmed || null,
     changes: ledgerId ? { ledgerTransactionId: ledgerId } : null,
   });
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: action === "note" ? "chargeback.note" : `chargeback.${to === from ? action : to}`,
     entityType: "chargeback",
@@ -489,18 +475,17 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
   const href = `/recharge/${id}`;
   const label = c.caseType === "chargeback" ? "recharge / chargeback" : "intercompany recharge";
   if (action === "submit") {
-    const reviewers = await filterByEntityAccess(tx, await usersWithPermission(tx, "chargebacks.review", c.brandId, [viewer.id]), [c.originalLegalEntityId, c.responsibleLegalEntityId]);
-    await notify(tx, reviewers, { kind: "approval_needed", title: `Review requested: ${id}`, body: `${c.amount} ${c.currency} ${label} awaiting review.`, href });
+    const reviewers = await filterByEntityAccess(await usersWithPermission("chargebacks.review", c.brandId, [viewer.id]), [c.originalLegalEntityId, c.responsibleLegalEntityId]);
+    await notify(reviewers, { kind: "approval_needed", title: `Review requested: ${id}`, body: `${c.amount} ${c.currency} ${label} awaiting review.`, href });
   } else if (action === "forward") {
     const approvers = await filterByEntityAccess(
-      tx,
-      await usersWithPermission(tx, "chargebacks.approve", c.brandId, policy.requireIndependentApproval ? [viewer.id, c.requestedBy] : [viewer.id]),
+      await usersWithPermission("chargebacks.approve", c.brandId, policy.requireIndependentApproval ? [viewer.id, c.requestedBy] : [viewer.id]),
       [c.originalLegalEntityId, c.responsibleLegalEntityId],
     );
-    await notify(tx, approvers, { kind: "approval_needed", title: `Approval needed: ${id}`, body: `${c.amount} ${c.currency} ${label} reviewed and awaiting approval.`, href });
+    await notify(approvers, { kind: "approval_needed", title: `Approval needed: ${id}`, body: `${c.amount} ${c.currency} ${label} reviewed and awaiting approval.`, href });
   }
   if (["forward", "return", "reject", "approve", "complete", "fail", "cancel"].includes(action) && c.requestedBy !== viewer.id) {
-    await notify(tx, [c.requestedBy], {
+    await notify([c.requestedBy], {
       kind: "case_update",
       title: `${id} ${to.replace(/_/g, " ")}`,
       body: trimmed ? `Note: ${trimmed.slice(0, 160)}` : `Your ${label} request moved to ${to.replace(/_/g, " ")}.`,
@@ -511,9 +496,10 @@ export async function transition(tx: DbOrTx, viewer: Viewer, id: string, action:
 }
 
 /** Record or update an external processor reference / evidence while the case is open. */
-export async function recordEvidence(tx: DbOrTx, viewer: Viewer, id: string, input: { externalProcessorReference?: string; evidenceSummary?: string }) {
+export async function recordEvidence(viewer: Viewer, id: string, input: { externalProcessorReference?: string; evidenceSummary?: string }) {
   if (!(can(viewer, "chargebacks.review") || can(viewer, "chargebacks.process"))) throw new BusinessRuleError("Requires review or processing permission.");
-  const [c] = await tx.select().from(chargebackCases).where(eq(chargebackCases.id, id));
+  const C = await getDb();
+  const c = await C.chargebackCases.findOne({ id });
   if (!c) throw new BusinessRuleError("Case not found.");
   if (!canAccessBrand(viewer, c.brandId) || (!canAccessEntity(viewer, c.originalLegalEntityId) && !canAccessEntity(viewer, c.responsibleLegalEntityId)))
     throw new BusinessRuleError("Case not accessible.");
@@ -521,11 +507,11 @@ export async function recordEvidence(tx: DbOrTx, viewer: Viewer, id: string, inp
   const ref = input.externalProcessorReference?.trim() || null;
   if (ref && !/^[A-Za-z0-9_\-.:]{4,80}$/.test(ref)) throw new BusinessRuleError("External reference has an invalid format.");
   const ev = input.evidenceSummary?.trim().slice(0, 2000) || null;
-  await tx
-    .update(chargebackCases)
-    .set({ externalProcessorReference: ref ?? c.externalProcessorReference, evidenceSummary: ev ?? c.evidenceSummary, updatedAt: new Date() })
-    .where(and(eq(chargebackCases.id, id), ne(chargebackCases.status, "completed")));
-  await tx.insert(chargebackEvents).values({
+  await C.chargebackCases.updateOne(
+    { id, status: { $ne: "completed" } },
+    { $set: { externalProcessorReference: ref ?? c.externalProcessorReference, evidenceSummary: ev ?? c.evidenceSummary, updatedAt: new Date() } },
+  );
+  await C.chargebackEvents.insertOne({
     caseId: id,
     action: "evidence_recorded",
     fromStatus: c.status,
@@ -533,7 +519,7 @@ export async function recordEvidence(tx: DbOrTx, viewer: Viewer, id: string, inp
     actorId: viewer.id,
     changes: { externalProcessorReference: ref, evidenceSummary: ev ? "updated" : undefined },
   });
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: "chargeback.evidence",
     entityType: "chargeback",

@@ -2,10 +2,9 @@
 
 import bcrypt from "bcryptjs";
 import { redirect } from "next/navigation";
-import { eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getDb } from "@/lib/db";
-import { users } from "@/lib/db/schema";
+import { equalsCi } from "@/lib/db/query";
 import { createSession, requestMeta } from "@/lib/auth/session";
 import { logActivity } from "@/lib/audit";
 
@@ -50,8 +49,8 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
   const { ip } = await requestMeta();
   if (ipThrottled(ip)) return { error: "Too many sign-in attempts. Wait a minute and try again.", email };
 
-  const db = await getDb();
-  const [user] = await db.select().from(users).where(eq(sql`lower(${users.email})`, email)).limit(1);
+  const C = await getDb();
+  const user = await C.users.findOne({ email: equalsCi(email) });
 
   if (!user) {
     await bcrypt.compare(password, getDummyHash());
@@ -63,14 +62,16 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) {
     const failures = user.failedLoginCount + 1;
-    await db
-      .update(users)
-      .set({
-        failedLoginCount: failures >= MAX_ATTEMPTS ? 0 : failures,
-        lockedUntil: failures >= MAX_ATTEMPTS ? new Date(Date.now() + LOCK_MINUTES * 60_000) : null,
-      })
-      .where(eq(users.id, user.id));
-    await logActivity(db, {
+    await C.users.updateOne(
+      { id: user.id },
+      {
+        $set: {
+          failedLoginCount: failures >= MAX_ATTEMPTS ? 0 : failures,
+          lockedUntil: failures >= MAX_ATTEMPTS ? new Date(Date.now() + LOCK_MINUTES * 60_000) : null,
+        },
+      },
+    );
+    await logActivity({
       actorId: user.id,
       action: failures >= MAX_ATTEMPTS ? "auth.locked" : "auth.failed",
       entityType: "user",
@@ -83,9 +84,9 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
     return { error: "This account is suspended. Contact a Super Admin.", email };
   }
 
-  await db.update(users).set({ failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date() }).where(eq(users.id, user.id));
+  await C.users.updateOne({ id: user.id }, { $set: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date() } });
   await createSession(user.id);
-  await logActivity(db, { actorId: user.id, action: "auth.login", entityType: "user", entityId: user.id, summary: `${user.name} signed in` });
+  await logActivity({ actorId: user.id, action: "auth.login", entityType: "user", entityId: user.id, summary: `${user.name} signed in` });
 
   // Only same-origin relative paths are honoured (no open redirects).
   const safeNext = next && next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/login") ? next : "/";

@@ -16,7 +16,7 @@
 ## Authorisation (server-side)
 - Every page calls `requireViewer()` + `can()`; every Server Action / Route
   Handler calls `authorize()`. Hiding navigation is cosmetic only.
-- Row-level scope is applied in SQL for every list and detail query:
+- Record-level scope is applied in the database query for every list and detail view:
   brand access, legal-entity access and ownership (agents see their own
   sales/invoices/cases). Changing ids in URLs or action payloads returns
   "Access restricted" / an error.
@@ -33,7 +33,7 @@
 ## Input & output handling
 - All inputs validated with Zod on the server; money parsed as decimal strings
   and computed in integer cents; totals always recomputed server-side.
-- Drizzle parameterises every query (no string-built SQL with user input).
+- Queries are built as MongoDB filter objects; user input is only ever a value (search text is regex-escaped), never an operator.
 - React escapes output (XSS); no `dangerouslySetInnerHTML`.
 - Server Actions are POST-only with Next.js origin checks (CSRF); the session
   cookie is `SameSite=Lax`.
@@ -52,7 +52,7 @@
   permission changes.
 
 ## Production checklist
-HTTPS only (HSTS), managed PostgreSQL with RLS policies, secrets in the
+HTTPS only (HSTS), MongoDB Atlas with a dedicated least-privilege database user and IP access list, secrets in the
 platform secret store, shared rate-limit store, MFA enrolment, backup/PITR,
 log shipping & alerting, dependency scanning, and a penetration test before
 go-live.

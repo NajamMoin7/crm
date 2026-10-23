@@ -1,55 +1,125 @@
 /**
- * Integrity probe of the demo DB (stop `next dev` first — PGlite is single-process).
+ * Integrity probe of the CRM database (local, or MONGODB_URI when set).
  *   npm run db:inspect
- * Exits non-zero if any business-consistency rule is violated.
+ * Exits non-zero if any business-consistency rule is violated. Read-only, except
+ * that it attempts (and expects to be refused) a few forbidden changes.
  */
-import { PGlite } from "@electric-sql/pglite";
-import { DATA_DIR } from "../lib/db/client";
-
-const RULES: [string, string][] = [
-  ["only two roles exist", "select id from roles where id not in ('super_admin','sales_agent')"],
-  ["every user has exactly one role", "select u.id from users u left join user_roles r on r.user_id = u.id group by u.id having count(r.role_id) <> 1"],
-  ["at least one active Super Admin", "select 1 where not exists (select 1 from users u join user_roles r on r.user_id = u.id where r.role_id = 'super_admin' and u.status = 'active')"],
-  ["every sales agent has at least one brand", "select u.id from users u join user_roles r on r.user_id = u.id and r.role_id = 'sales_agent' where not exists (select 1 from user_brand_access b where b.user_id = u.id)"],
-  ["sale agent is authorised for the sale's brand", "select s.id from sales s where not exists (select 1 from user_brand_access b where b.user_id = s.agent_id and b.brand_id = s.brand_id)"],
-  ["sale customer is linked to the sale's brand", "select s.id from sales s where not exists (select 1 from customer_brand_relationships c where c.customer_id = s.customer_id and c.brand_id = s.brand_id)"],
-  ["sale legal entity is mapped to its brand", "select s.id from sales s where not exists (select 1 from brand_legal_entities m where m.brand_id = s.brand_id and m.legal_entity_id = s.legal_entity_id and m.scope in ('sale','all'))"],
-  ["invoice matches its sale (brand, customer, entity, agent, total)", "select i.id from invoices i join sales s on s.id = i.sale_id where i.brand_id <> s.brand_id or i.customer_id <> s.customer_id or i.legal_entity_id <> s.legal_entity_id or i.agent_id <> s.agent_id or i.total <> s.total"],
-  ["invoice amount_paid equals succeeded payments", "select i.id from invoices i where i.amount_paid <> coalesce((select sum(t.amount) from transactions t where t.invoice_id = i.id and t.type = 'payment' and t.status = 'succeeded'), 0) - coalesce((select sum(t.amount) from transactions t where t.invoice_id = i.id and t.type = 'refund' and t.status = 'succeeded'), 0)"],
-  ["payments carry their invoice's brand and entity", "select t.id from transactions t join invoices i on i.id = t.invoice_id where t.type = 'payment' and (t.brand_id <> i.brand_id or t.legal_entity_id <> i.legal_entity_id or t.customer_id <> i.customer_id)"],
-  ["chargeback references a payment of the same brand/customer/invoice/entity", "select c.id from chargeback_cases c join transactions t on t.id = c.original_transaction_id where t.type <> 'payment' or t.brand_id <> c.brand_id or t.customer_id <> c.customer_id or t.invoice_id <> c.invoice_id or t.legal_entity_id <> c.original_legal_entity_id"],
-  ["chargebacks never exceed the original payment", "select t.id from transactions t where t.type = 'payment' and t.amount < (select coalesce(sum(c.amount), 0) from chargeback_cases c where c.original_transaction_id = t.id and c.case_type = 'chargeback' and c.status not in ('rejected','failed','cancelled'))"],
-  ["completed cases have a ledger row booked against the original entity", "select c.id from chargeback_cases c left join transactions t on t.id = c.ledger_transaction_id where c.status = 'completed' and (t.id is null or t.legal_entity_id <> c.original_legal_entity_id or t.amount <> c.amount)"],
-  ["requesters never approved their own case", "select id from chargeback_cases where decided_by = requested_by"],
-];
+import { connectMongo } from "../lib/db/client";
+import { collectionName, makeCollections, type RowOf, type TableKey } from "../lib/db/collections";
+import { toCents } from "../lib/money";
 
 async function main() {
-  const c = await PGlite.create(DATA_DIR);
+  const conn = await connectMongo();
+  const C = makeCollections(conn.db);
+  const all = async <K extends TableKey>(k: K) => (await C[k].find().toArray()) as RowOf<K>[];
+  const [roles, users, userRoles, access, sales, rels, maps, invoices, txns, cases] = await Promise.all([
+    all("roles"), all("users"), all("userRoles"), all("userBrandAccess"), all("sales"), all("customerBrandRelationships"),
+    all("brandLegalEntities"), all("invoices"), all("transactions"), all("chargebackCases"),
+  ]);
+  const roleOf = (u: string) => userRoles.filter((r) => r.userId === u).map((r) => r.roleId);
+  const hasBrand = (u: string, b: string) => access.some((a) => a.userId === u && a.brandId === b);
+  const sum = (list: { amount: string }[]) => list.reduce((a, t) => a + toCents(t.amount), 0);
+  const activeCase = (c: RowOf<"chargebackCases">) => !["rejected", "failed", "cancelled"].includes(c.status);
+
+  const RULES: [string, unknown[]][] = [
+    ["only two roles exist", roles.filter((r) => !["super_admin", "sales_agent"].includes(r.id)).map((r) => r.id)],
+    ["every user has exactly one role", users.filter((u) => roleOf(u.id).length !== 1).map((u) => u.id)],
+    ["at least one active Super Admin", users.some((u) => u.status === "active" && roleOf(u.id).includes("super_admin")) ? [] : ["none"]],
+    ["every sales agent has at least one brand", users.filter((u) => roleOf(u.id).includes("sales_agent") && !access.some((a) => a.userId === u.id)).map((u) => u.id)],
+    ["sale agent is authorised for the sale's brand", sales.filter((s) => !hasBrand(s.agentId, s.brandId)).map((s) => s.id)],
+    ["sale customer is linked to the sale's brand", sales.filter((s) => !rels.some((r) => r.customerId === s.customerId && r.brandId === s.brandId)).map((s) => s.id)],
+    [
+      "sale legal entity is valid for its brand",
+      sales.filter((s) => maps.some((m) => m.brandId === s.brandId) && !maps.some((m) => m.brandId === s.brandId && m.legalEntityId === s.legalEntityId && ["sale", "all"].includes(m.scope))).map((s) => s.id),
+    ],
+    [
+      "invoice matches its sale (brand, customer, entity, agent, total)",
+      invoices
+        .filter((i) => {
+          const s = sales.find((x) => x.id === i.saleId);
+          return !s || s.brandId !== i.brandId || s.customerId !== i.customerId || s.legalEntityId !== i.legalEntityId || s.agentId !== i.agentId || toCents(s.total) !== toCents(i.total);
+        })
+        .map((i) => i.id),
+    ],
+    [
+      "invoice amount paid equals succeeded payments minus refunds",
+      invoices
+        .filter((i) => {
+          const ok = txns.filter((t) => t.invoiceId === i.id && t.status === "succeeded");
+          return toCents(i.amountPaid) !== sum(ok.filter((t) => t.type === "payment")) - sum(ok.filter((t) => t.type === "refund"));
+        })
+        .map((i) => i.id),
+    ],
+    [
+      "payments carry their invoice's brand, entity and customer",
+      txns
+        .filter((t) => t.type === "payment")
+        .filter((t) => {
+          const i = invoices.find((x) => x.id === t.invoiceId);
+          return !i || t.brandId !== i.brandId || t.legalEntityId !== i.legalEntityId || t.customerId !== i.customerId;
+        })
+        .map((t) => t.id),
+    ],
+    [
+      "chargeback references a payment of the same brand / customer / invoice / entity",
+      cases
+        .filter((c) => {
+          const t = txns.find((x) => x.id === c.originalTransactionId);
+          return !t || t.type !== "payment" || t.brandId !== c.brandId || t.customerId !== c.customerId || t.invoiceId !== c.invoiceId || t.legalEntityId !== c.originalLegalEntityId;
+        })
+        .map((c) => c.id),
+    ],
+    [
+      "chargebacks never exceed the original payment",
+      txns.filter((t) => t.type === "payment" && toCents(t.amount) < sum(cases.filter((c) => c.originalTransactionId === t.id && c.caseType === "chargeback" && activeCase(c)))).map((t) => t.id),
+    ],
+    [
+      "completed cases have a ledger row booked against the original entity",
+      cases
+        .filter((c) => c.status === "completed")
+        .filter((c) => {
+          const t = txns.find((x) => x.id === c.ledgerTransactionId);
+          return !t || t.legalEntityId !== c.originalLegalEntityId || toCents(t.amount) !== toCents(c.amount);
+        })
+        .map((c) => c.id),
+    ],
+    ["requesters never approved their own case", cases.filter((c) => c.decidedBy && c.decidedBy === c.requestedBy).map((c) => c.id)],
+  ];
+
   let failed = 0;
-  for (const [label, q] of RULES) {
-    const rows = (await c.query(q)).rows;
-    console.log(`${rows.length === 0 ? "✓" : "✗"} ${label}${rows.length ? ` — ${JSON.stringify(rows).slice(0, 200)}` : ""}`);
-    if (rows.length) failed++;
+  for (const [label, bad] of RULES) {
+    console.log(`${bad.length === 0 ? "✓" : "✗"} ${label}${bad.length ? ` — ${JSON.stringify(bad).slice(0, 200)}` : ""}`);
+    if (bad.length) failed++;
   }
-  const tryq = async (label: string, q: string) => {
+
+  const refused = async (label: string, attempt: () => Promise<unknown>) => {
     try {
-      await c.query(q);
+      await attempt();
       failed++;
       console.log(`✗ ${label} — was allowed`);
     } catch (e) {
       console.log(`✓ ${label} — blocked: ${(e as Error).message.slice(0, 70)}`);
     }
   };
-  await tryq("activity log is append-only", "update activity_logs set summary = 'x' where id = (select min(id) from activity_logs)");
-  await tryq("ledger rows cannot be deleted", "delete from transactions where id = (select min(id) from transactions)");
-  await tryq("ledger amounts are immutable", "update transactions set amount = 1 where id = (select min(id) from transactions)");
-  await tryq("closed cases cannot be edited", "update chargeback_cases set amount = 1 where id = (select id from chargeback_cases where status = 'completed' limit 1)");
-  for (const t of ["roles", "users", "brands", "legal_entities", "customers", "sales", "invoices", "transactions", "chargeback_cases", "activity_logs", "notifications"]) {
-    const r = await c.query<{ n: number }>(`select count(*)::int as n from ${t}`);
-    console.log(`  ${t.padEnd(18)} ${r.rows[0].n}`);
+  const firstLog = await C.activityLogs.findOne({}, { sort: { id: 1 } });
+  const firstTxn = txns[0];
+  const closed = cases.find((c) => c.status === "completed");
+  if (firstLog) await refused("activity log is append-only", () => C.activityLogs.updateOne({ id: firstLog.id }, { $set: { summary: "x" } }));
+  if (firstTxn) {
+    await refused("ledger rows cannot be deleted", () => C.transactions.deleteOne({ id: firstTxn.id }));
+    await refused("ledger amounts are immutable", () => C.transactions.updateOne({ id: firstTxn.id }, { $set: { amount: "1.00" } }));
   }
-  await c.close();
+  if (closed) await refused("closed cases cannot be edited", () => C.chargebackCases.updateOne({ id: closed.id }, { $set: { amount: "1.00" } }));
+
+  for (const k of ["roles", "users", "brands", "legalEntities", "customers", "sales", "invoices", "transactions", "chargebackCases", "activityLogs", "notifications"] as TableKey[]) {
+    console.log(`  ${collectionName(k).padEnd(18)} ${await (C[k] as unknown as { countDocuments(): Promise<number> }).countDocuments()}`);
+  }
+  await conn.close();
   console.log(failed ? `\n${failed} check(s) failed` : "\nAll integrity checks passed");
   process.exit(failed ? 1 : 0);
 }
-main();
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

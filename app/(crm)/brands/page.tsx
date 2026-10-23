@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { asc, sql } from "drizzle-orm";
 import { Building2, Trash2 } from "lucide-react";
 import { PageHeader } from "@/components/crm/page-header";
 import { EmptyState } from "@/components/crm/empty-state";
@@ -9,7 +8,6 @@ import { AccessDenied } from "@/components/crm/access-denied";
 import { BrandDialog } from "@/components/brands/brand-dialog";
 import { can, requireViewer } from "@/lib/auth/viewer";
 import { getDb } from "@/lib/db";
-import { brands } from "@/lib/db/schema";
 import { deleteBrandAction } from "./actions";
 import { fmtDate, fmtNumber } from "@/lib/format";
 
@@ -18,21 +16,14 @@ export const metadata: Metadata = { title: "Brands" };
 export default async function BrandsPage() {
   const viewer = await requireViewer();
   if (!can(viewer, "brands.manage")) return <AccessDenied />;
-  const db = await getDb();
-  const rows = await db
-    .select({
-      id: brands.id,
-      code: brands.code,
-      name: brands.name,
-      color: brands.color,
-      logoUrl: brands.logoUrl,
-      createdAt: brands.createdAt,
-      // Explicit aliases: in single-table selects Drizzle emits bare column names.
-      customers: sql<number>`(select count(*)::int from customer_brand_relationships cbr where cbr.brand_id = "brands"."id")`,
-      salesCount: sql<number>`(select count(*)::int from sales s where s.brand_id = "brands"."id")`,
-    })
-    .from(brands)
-    .orderBy(asc(brands.createdAt), asc(brands.name));
+  const C = await getDb();
+  const [list, customerCounts, saleCounts] = await Promise.all([
+    C.brands.find({}, { sort: { createdAt: 1, name: 1 }, projection: { id: 1, code: 1, name: 1, color: 1, logoUrl: 1, createdAt: 1 } }).toArray(),
+    C.customerBrandRelationships.aggregate<{ _id: string; n: number }>([{ $group: { _id: "$brandId", n: { $sum: 1 } } }]).toArray(),
+    C.sales.aggregate<{ _id: string; n: number }>([{ $group: { _id: "$brandId", n: { $sum: 1 } } }]).toArray(),
+  ]);
+  const count = (rows: { _id: string; n: number }[], id: string) => rows.find((r) => r._id === id)?.n ?? 0;
+  const rows = list.map((b) => ({ ...b, customers: count(customerCounts, b.id), salesCount: count(saleCounts, b.id) }));
 
   return (
     <>

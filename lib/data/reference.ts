@@ -1,15 +1,14 @@
 import "server-only";
 import { cache } from "react";
-import { asc, eq, inArray } from "drizzle-orm";
 import { getDb } from "@/lib/db";
-import { brands, salesAgents, userBrandAccess, users } from "@/lib/db/schema";
+import { ids } from "@/lib/db/query";
 import type { BrandLite } from "@/components/crm/brand-badge";
 import type { Viewer } from "@/lib/auth/viewer";
 
 /** Reference lists, memoised per request. */
 export const getAllBrands = cache(async () => {
-  const db = await getDb();
-  return db.select().from(brands).orderBy(asc(brands.name));
+  const C = await getDb();
+  return C.brands.find({}, { sort: { name: 1 } }).toArray();
 });
 
 export async function getBrandMap(): Promise<Map<string, BrandLite>> {
@@ -19,29 +18,29 @@ export async function getBrandMap(): Promise<Map<string, BrandLite>> {
 
 export async function getViewerBrands(viewer: Viewer, opts: { activeOnly?: boolean } = {}): Promise<BrandLite[]> {
   const list = await getAllBrands();
-  const ids = opts.activeOnly ? viewer.activeBrandIds : viewer.brandIds;
+  const allowed = opts.activeOnly ? viewer.activeBrandIds : viewer.brandIds;
   return list
-    .filter((b) => ids.includes(b.id))
+    .filter((b) => allowed.includes(b.id))
     .map((b) => ({ id: b.id, code: b.code, name: b.name, color: b.color, logoUrl: b.logoUrl }));
 }
 
 export const getAgents = cache(async () => {
-  const db = await getDb();
-  const rows = await db
-    .select({
-      id: users.id,
-      name: users.name,
-      email: users.email,
-      status: users.status,
-      agentCode: salesAgents.agentCode,
-      team: salesAgents.team,
-      monthlyTarget: salesAgents.monthlyTarget,
+  const C = await getDb();
+  const agents = await C.salesAgents.find().toArray();
+  const userIds = agents.map((a) => a.userId);
+  const [people, access] = await Promise.all([
+    C.users.find({ id: { $in: ids(userIds) } }, { projection: { id: 1, name: 1, email: 1, status: 1 } }).toArray(),
+    C.userBrandAccess.find({ userId: { $in: ids(userIds) } }).toArray(),
+  ]);
+  return agents
+    .flatMap((a) => {
+      const u = people.find((p) => p.id === a.userId);
+      return u
+        ? [{ id: u.id, name: u.name, email: u.email, status: u.status, agentCode: a.agentCode, team: a.team, monthlyTarget: a.monthlyTarget }]
+        : [];
     })
-    .from(salesAgents)
-    .innerJoin(users, eq(users.id, salesAgents.userId))
-    .orderBy(asc(users.name));
-  const access = await db.select().from(userBrandAccess).where(inArray(userBrandAccess.userId, rows.map((r) => r.id).concat("__none__")));
-  return rows.map((r) => ({ ...r, brandIds: access.filter((a) => a.userId === r.id).map((a) => a.brandId) }));
+    .sort((x, y) => x.name.localeCompare(y.name))
+    .map((r) => ({ ...r, brandIds: access.filter((a) => a.userId === r.id).map((a) => a.brandId) }));
 });
 
 /** Agents that share at least one brand with the viewer (for filter dropdowns). */
@@ -53,8 +52,8 @@ export async function getAgentOptions(viewer: Viewer) {
 }
 
 export const getUserNames = cache(async () => {
-  const db = await getDb();
-  const rows = await db.select({ id: users.id, name: users.name }).from(users);
+  const C = await getDb();
+  const rows = await C.users.find({}, { projection: { id: 1, name: 1 } }).toArray();
   return new Map(rows.map((r) => [r.id, r.name]));
 });
 

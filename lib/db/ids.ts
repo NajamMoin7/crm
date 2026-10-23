@@ -1,7 +1,6 @@
-import { sql } from "drizzle-orm";
-import type { DbOrTx } from "./client";
+import { registeredCollections } from "./collections";
 
-/** Identifier formats. Numbers come from id_counters, so ids are never reused. */
+/** Identifier formats. Numbers come from the id_counters collection, so ids are never reused. */
 export const ID_FORMATS = {
   user: (n: number) => `USR-${String(n).padStart(4, "0")}`,
   customer: (n: number) => `CUS-${100000 + n}`,
@@ -27,27 +26,25 @@ export const ID_FORMATS = {
 
 export type IdKind = keyof typeof ID_FORMATS;
 
-async function bump(db: DbOrTx, name: string): Promise<number> {
-  const res = await db.execute<{ value: number }>(
-    sql`INSERT INTO id_counters (name, value) VALUES (${name}, 1)
-        ON CONFLICT (name) DO UPDATE SET value = id_counters.value + 1
-        RETURNING value`,
-  );
-  return Number(res.rows[0].value);
+/** Atomic counter (joins the current transaction, so a rolled-back save doesn't burn a number). */
+export async function nextSequence(name: string): Promise<number> {
+  const C = registeredCollections();
+  const row = await C.idCounters.findOneAndUpdate({ name }, { $inc: { value: 1 } }, { upsert: true });
+  return Number(row!.value);
 }
 
-export async function nextId(db: DbOrTx, kind: IdKind): Promise<string> {
-  return ID_FORMATS[kind](await bump(db, kind));
+export async function nextId(kind: IdKind): Promise<string> {
+  return ID_FORMATS[kind](await nextSequence(kind));
 }
 
 /** Chargeback / recharge case ids restart numbering each year: RCB-2026-0042. */
-export async function nextCaseId(db: DbOrTx, at = new Date()): Promise<string> {
+export async function nextCaseId(at = new Date()): Promise<string> {
   const year = at.getUTCFullYear();
-  return `RCB-${year}-${String(await bump(db, `case:${year}`)).padStart(4, "0")}`;
+  return `RCB-${year}-${String(await nextSequence(`case:${year}`)).padStart(4, "0")}`;
 }
 
 /** Customer-facing invoice number, unique per brand prefix and year: LTD-2026-000123. */
-export async function nextInvoiceNumber(db: DbOrTx, prefix: string, at = new Date()): Promise<string> {
+export async function nextInvoiceNumber(prefix: string, at = new Date()): Promise<string> {
   const year = at.getUTCFullYear();
-  return `${prefix}-${year}-${String(await bump(db, `invnum:${prefix}:${year}`)).padStart(6, "0")}`;
+  return `${prefix}-${year}-${String(await nextSequence(`invnum:${prefix}:${year}`)).padStart(6, "0")}`;
 }

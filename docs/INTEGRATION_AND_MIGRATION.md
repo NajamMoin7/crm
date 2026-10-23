@@ -25,7 +25,7 @@ run records to the demo database.
   stored in the database, never sent to the browser and never logged.
 - Use read-only DB users on replicas for extraction. Writes back to brand
   systems (if ever needed) go through their APIs with separate credentials.
-- Production app secrets: `DATABASE_URL` (PostgreSQL), session settings,
+- Production app secrets: `MONGODB_URI` (MongoDB Atlas), session settings,
   processor API keys (tokenised flows only) — managed in the hosting
   platform's secret store.
 
@@ -62,24 +62,20 @@ run records to the demo database.
     keep a tested rollback procedure (batch-scoped deletes by run id on a
     staging copy, or PITR restore in production).
 
-## Switching the CRM from PGlite to PostgreSQL
+## Running the CRM on MongoDB Atlas
 
-1. Provision PostgreSQL 15+ and set `DATABASE_URL`.
-2. Replace `createPgliteDb` in `lib/db/client.ts` with
-   `drizzle(new Pool({ connectionString }))` from `drizzle-orm/node-postgres`
-   (types are identical; the `Tx` type alias keeps working).
-3. Run `drizzle-kit migrate` (or the runtime migrator) — the SQL in `drizzle/`
-   is plain PostgreSQL, including the append-only triggers.
-4. Do **not** run the demo seed in production.
-5. Add PostgreSQL row-level-security policies mirroring `lib/auth/scope.ts`.
-6. Move rate limiting (login, search) to a shared store (Redis/Upstash) so it
+1. Create the Atlas cluster and a database user for the app only; set `MONGODB_URI`.
+2. `npm run db:setup -- --yes` once — creates the indexes and loads the data
+   (it refuses a database that already has users).
+3. Do **not** load the demo seed into a production database.
+4. Move rate limiting (login, search) to a shared store (Redis/Upstash) so it
    works across instances.
 
 ## Backup, reconciliation and rollback
 
-- Daily full backups + WAL/PITR, restore tested monthly.
+- Daily backups with point-in-time recovery (Atlas continuous backup), restore tested monthly.
 - Monthly reconciliation per brand × legal entity (`reconciliation_records`):
   processor settlements vs ledger payments; chargeback debits vs completed
   cases; exceptions resolved with notes (audited).
 - Ledger corrections are always new rows (refund, reversal, adjustment); the
-  DB rejects edits to completed financial history.
+  data layer rejects edits to completed financial history.

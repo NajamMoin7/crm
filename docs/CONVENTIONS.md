@@ -36,9 +36,11 @@ pattern below is the **Customers** module:
 
 ## Data access & security (non-negotiable)
 
-- DB: `const db = await getDb()` from `@/lib/db` (Drizzle on PGlite = real
-  PostgreSQL). Schema in `lib/db/schema.ts`. Never write raw SQL strings with
-  interpolated user input; use Drizzle operators or the `sql` template.
+- DB: `const C = await getDb()` from `@/lib/db` (MongoDB). Collections are
+  `C.customers`, `C.invoices`, …; document shapes come from `lib/db/schema.ts`.
+  Multi-step writes go in `withTransaction(() => …)`; inside it, run database
+  calls one after another (no `Promise.all`). Search text goes through
+  `contains()` / `equalsCi()` from `lib/db/query.ts` (regex-escaped).
 - Authorisation is server-side only:
   - Pages: `const viewer = await requireViewer(); if (!can(viewer, "perm")) return <AccessDenied />;`
   - Server Actions / Route Handlers: `const viewer = await authorize("perm")`
@@ -59,12 +61,12 @@ pattern below is the **Customers** module:
   do arithmetic in integer cents (`lib/money.ts`); store with `fromCents()`.
 - Every mutation runs in `db.transaction(async (tx) => …)` and writes an
   audit entry with `logActivity(tx, {...})` (`lib/audit.ts`). Never log
-  passwords, card numbers, CVV or secrets. Use `notify(tx, userIds, {...})`
+  passwords, card numbers, CVV or secrets. Use `notify(userIds, {...})`
   for user notifications (always include an `href`).
-- New ids: `await nextId(tx, "kind")` (`lib/db/ids.ts`), invoice numbers via
+- New ids: `await nextId("kind")` (`lib/db/ids.ts`), invoice numbers via
   `nextInvoiceNumber`, case ids via `nextCaseId`.
 - Ledger (`transactions`) rows, `activity_logs`, `chargeback_events` and
-  `customer_merge_history` are append-only (DB triggers). Corrections are new
+  `customer_merge_history` are append-only (enforced in `lib/db/collections.ts`). Corrections are new
   rows (refund, reversal, adjustment) — never UPDATE money fields.
 - Gross sales ≠ collected payments ≠ outstanding ≠ refunds ≠ chargebacks ≠
   internal transfers. `intercompany_recharge` ledger rows are never revenue.
@@ -100,8 +102,9 @@ pattern below is the **Customers** module:
 
 ## Testing
 
-- Dev server: `npx next dev --port 3100` (PGlite locks `.data/pglite`; stop
-  the server before `npm run db:reset`).
+- Test server on its own database copy:
+  `CRM_DATA_DIR=.data/mongo-test CRM_MONGO_PORT=27319 npx next dev --port 3100`;
+  reset it with the same two variables and `npm run db:reset` (works while it runs).
 - Browser tests: `npx tsx scripts/e2e/<file>.ts` using
   `scripts/e2e/harness.ts` (`launch`, `login(browser, email)`, `visit`,
   `check`, `shot`, `summary`). Demo password `Demo@2026!`.

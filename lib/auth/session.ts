@@ -2,9 +2,7 @@ import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 import { cookies, headers } from "next/headers";
 import { connection } from "next/server";
-import { and, eq, gt } from "drizzle-orm";
 import { getDb } from "@/lib/db";
-import { sessions, users } from "@/lib/db/schema";
 
 export const SESSION_COOKIE = "crm_session";
 const SESSION_HOURS = 12;
@@ -22,11 +20,11 @@ export async function requestMeta() {
 
 /** Issues an opaque random token; only its SHA-256 hash is stored server-side. */
 export async function createSession(userId: string) {
-  const db = await getDb();
+  const C = await getDb();
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + SESSION_HOURS * 3600_000);
   const meta = await requestMeta();
-  await db.insert(sessions).values({ idHash: hashToken(token), userId, expiresAt, ip: meta.ip, userAgent: meta.userAgent });
+  await C.sessions.insertOne({ idHash: hashToken(token), userId, expiresAt, ip: meta.ip, userAgent: meta.userAgent });
   (await cookies()).set(SESSION_COOKIE, token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
@@ -42,17 +40,14 @@ export async function readSessionUserId(): Promise<string | null> {
   await connection();
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token || token.length > 100) return null;
-  const db = await getDb();
+  const C = await getDb();
   const idHash = hashToken(token);
-  const [row] = await db
-    .select({ userId: sessions.userId, lastSeenAt: sessions.lastSeenAt, status: users.status })
-    .from(sessions)
-    .innerJoin(users, eq(users.id, sessions.userId))
-    .where(and(eq(sessions.idHash, idHash), gt(sessions.expiresAt, new Date())))
-    .limit(1);
-  if (!row || row.status !== "active") return null;
+  const row = await C.sessions.findOne({ idHash, expiresAt: { $gt: new Date() } });
+  if (!row) return null;
+  const user = await C.users.findOne({ id: row.userId }, { projection: { status: 1 } });
+  if (user?.status !== "active") return null;
   if (Date.now() - row.lastSeenAt.getTime() > IDLE_REFRESH_MS) {
-    await db.update(sessions).set({ lastSeenAt: new Date() }).where(eq(sessions.idHash, idHash));
+    await C.sessions.updateOne({ idHash }, { $set: { lastSeenAt: new Date() } });
   }
   return row.userId;
 }
@@ -61,13 +56,13 @@ export async function destroySession() {
   const jar = await cookies();
   const token = jar.get(SESSION_COOKIE)?.value;
   if (token) {
-    const db = await getDb();
-    await db.delete(sessions).where(eq(sessions.idHash, hashToken(token)));
+    const C = await getDb();
+    await C.sessions.deleteOne({ idHash: hashToken(token) });
   }
   jar.delete(SESSION_COOKIE);
 }
 
 export async function revokeUserSessions(userId: string) {
-  const db = await getDb();
-  await db.delete(sessions).where(eq(sessions.userId, userId));
+  const C = await getDb();
+  await C.sessions.deleteMany({ userId });
 }

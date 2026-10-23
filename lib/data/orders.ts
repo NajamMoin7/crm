@@ -1,62 +1,60 @@
 import "server-only";
-import { and, desc, eq, ilike, ne, or, sql } from "drizzle-orm";
-import { getDb } from "@/lib/db";
-import { customers, invoices, sales, salesAgents, users } from "@/lib/db/schema";
+import type { Filter } from "mongodb";
+import { getDb, type RowOf } from "@/lib/db";
+import { byKey, contains, dec, decStr, ids, startOf, uniq } from "@/lib/db/query";
 import { scopeSales } from "@/lib/auth/scope";
 import { can, type Viewer } from "@/lib/auth/viewer";
 
 export type PeriodTotal = { cents: number; count: number };
 export type AgentTotals = { agentId: string; name: string; today: PeriodTotal; prevMonth: PeriodTotal; thisMonth: PeriodTotal; year: PeriodTotal };
 
-const cents = (v: unknown) => Math.round(Number(v ?? 0) * 100);
+const cents = (v: unknown) => Math.round(Number(decStr(v)) * 100);
 
 /**
  * Takings per agent for today, last month, this month and this year (non-cancelled
- * sales, by sale date, server time zone). Super Admins see every agent; an agent
+ * sales, by sale date, UTC periods). Super Admins see every agent; an agent
  * sees only their own row.
  */
 export async function getAgentTotals(viewer: Viewer, brand: string | null): Promise<AgentTotals[]> {
-  const db = await getDb();
-  const period = (cond: string) => ({
-    sum: sql.raw(`coalesce(sum("sales"."total") filter (where ${cond}), 0)::text`),
-    n: sql.raw(`(count(*) filter (where ${cond}))::int`),
+  const C = await getDb();
+  const now = new Date();
+  const day = startOf("day", now);
+  const month = startOf("month", now);
+  const prevMonth = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() - 1, 1));
+  const year = startOf("year", now);
+  const inPeriod = (from: Date, to?: Date) => (to ? { $and: [{ $gte: ["$saleDate", from] }, { $lt: ["$saleDate", to] }] } : { $gte: ["$saleDate", from] });
+  const period = (cond: unknown) => ({
+    sum: { $sum: { $cond: [cond, dec("$total"), dec("0")] } },
+    n: { $sum: { $cond: [cond, 1, 0] } },
   });
-  const today = period(`"sales"."sale_date" >= date_trunc('day', now())`);
-  const prev = period(`"sales"."sale_date" >= date_trunc('month', now()) - interval '1 month' and "sales"."sale_date" < date_trunc('month', now())`);
-  const month = period(`"sales"."sale_date" >= date_trunc('month', now())`);
-  const year = period(`"sales"."sale_date" >= date_trunc('year', now())`);
-  const rows = await db
-    .select({
-      agentId: sales.agentId,
-      tSum: sql<string>`${today.sum}`,
-      tN: sql<number>`${today.n}`,
-      pSum: sql<string>`${prev.sum}`,
-      pN: sql<number>`${prev.n}`,
-      mSum: sql<string>`${month.sum}`,
-      mN: sql<number>`${month.n}`,
-      ySum: sql<string>`${year.sum}`,
-      yN: sql<number>`${year.n}`,
-    })
-    .from(sales)
-    .where(and(scopeSales(viewer, brand), ne(sales.status, "cancelled")))
-    .groupBy(sales.agentId);
+  const t = period(inPeriod(day));
+  const p = period(inPeriod(prevMonth, month));
+  const m = period(inPeriod(month));
+  const y = period(inPeriod(year));
+  const rows = await C.sales
+    .aggregate<{ _id: string; tSum: unknown; tN: number; pSum: unknown; pN: number; mSum: unknown; mN: number; ySum: unknown; yN: number }>([
+      { $match: { $and: [scopeSales(viewer, brand), { status: { $ne: "cancelled" } }] } },
+      { $group: { _id: "$agentId", tSum: t.sum, tN: t.n, pSum: p.sum, pN: p.n, mSum: m.sum, mN: m.n, ySum: y.sum, yN: y.n } },
+    ])
+    .toArray();
 
   // Every active agent appears (with zeros) so the table compares the whole team.
-  const agentList = can(viewer, "sales.view_all")
-    ? await db
-        .select({ id: users.id, name: users.name })
-        .from(users)
-        .innerJoin(salesAgents, eq(salesAgents.userId, users.id))
-        .where(eq(users.status, "active"))
-    : [{ id: viewer.id, name: viewer.name }];
-  const ids = new Set([...agentList.map((a) => a.id), ...rows.map((r) => r.agentId)]);
-  const names = new Map(agentList.map((a) => [a.id, a.name]));
-  if ([...ids].some((id) => !names.has(id))) {
-    for (const u of await db.select({ id: users.id, name: users.name }).from(users)) names.set(u.id, u.name);
+  let agentList: { id: string; name: string }[];
+  if (can(viewer, "sales.view_all")) {
+    const agentIds = await C.salesAgents.distinct("userId");
+    agentList = await C.users.find({ id: { $in: ids(agentIds) }, status: "active" }, { projection: { id: 1, name: 1 } }).toArray();
+  } else {
+    agentList = [{ id: viewer.id, name: viewer.name }];
   }
-  return [...ids]
+  const allIds = new Set([...agentList.map((a) => a.id), ...rows.map((r) => r._id)]);
+  const names = new Map(agentList.map((a) => [a.id, a.name]));
+  const missing = [...allIds].filter((id) => !names.has(id));
+  if (missing.length) {
+    for (const u of await C.users.find({ id: { $in: missing } }, { projection: { id: 1, name: 1 } }).toArray()) names.set(u.id, u.name);
+  }
+  return [...allIds]
     .map((id) => {
-      const r = rows.find((x) => x.agentId === id);
+      const r = rows.find((x) => x._id === id);
       return {
         agentId: id,
         name: names.get(id) ?? id,
@@ -73,63 +71,102 @@ export const ORDERS_PAGE_SIZE = 20;
 
 /** Orders = invoices with their sale, customer, agent, latest payment and chargeback count. */
 export async function listOrders(viewer: Viewer, f: { q: string; brand: string | null; agent: string | null; page: number }) {
-  const db = await getDb();
-  const like = f.q ? `%${f.q.replace(/[%_]/g, "")}%` : null;
-  const digits = f.q.replace(/\D/g, "");
-  const where = and(
-    scopeSales(viewer, f.brand),
-    f.agent && can(viewer, "sales.view_all") ? eq(sales.agentId, f.agent) : undefined,
-    like
-      ? or(
-          ilike(customers.fullName, like),
-          ilike(customers.email, like),
-          ilike(invoices.invoiceNumber, like),
-          ilike(invoices.sourceRecordId, like),
-          ilike(sales.id, like),
-          digits.length >= 4 ? ilike(customers.phoneNormalized, `%${digits}%`) : undefined,
-          sql`exists (select 1 from transactions t where t.invoice_id = "invoices"."id" and (t.payment_reference ilike ${like} or t.id ilike ${like}))`,
-        )
-      : undefined,
-  );
-  const base = db
-    .select({
-      invoiceId: invoices.id,
-      invoiceNumber: invoices.invoiceNumber,
-      agentInvoiceNumber: invoices.sourceRecordId,
-      status: invoices.status,
-      total: invoices.total,
-      amountPaid: invoices.amountPaid,
-      currency: invoices.currency,
-      paymentMethod: invoices.paymentMethod,
-      billingDate: invoices.billingDate,
-      saleId: sales.id,
-      createdAt: sales.createdAt,
-      brandId: sales.brandId,
-      agentId: sales.agentId,
-      agentName: users.name,
-      description: sql<string | null>`(select si.description from sale_items si where si.sale_id = "sales"."id" order by si.id limit 1)`,
-      customerId: customers.id,
-      customerName: customers.fullName,
-      customerEmail: customers.email,
-      customerPhone: customers.phone,
-      billingAddress: invoices.billingAddress,
-      paymentId: sql<string | null>`(select t.id from transactions t where t.invoice_id = "invoices"."id" and t.type = 'payment' and t.status = 'succeeded' order by t.occurred_at desc limit 1)`,
-      paymentReference: sql<string | null>`(select t.payment_reference from transactions t where t.invoice_id = "invoices"."id" and t.type = 'payment' and t.status = 'succeeded' order by t.occurred_at desc limit 1)`,
-      chargebacks: sql<number>`(select count(*)::int from chargeback_cases c where c.invoice_id = "invoices"."id")`,
-    })
-    .from(invoices)
-    .innerJoin(sales, eq(sales.id, invoices.saleId))
-    .innerJoin(customers, eq(customers.id, invoices.customerId))
-    .leftJoin(users, eq(users.id, sales.agentId))
-    .where(where);
-  const [rows, [{ total }]] = await Promise.all([
-    base.orderBy(desc(sales.saleDate), desc(invoices.id)).limit(ORDERS_PAGE_SIZE).offset((f.page - 1) * ORDERS_PAGE_SIZE),
-    db
-      .select({ total: sql<number>`count(*)::int` })
-      .from(invoices)
-      .innerJoin(sales, eq(sales.id, invoices.saleId))
-      .innerJoin(customers, eq(customers.id, invoices.customerId))
-      .where(where),
+  const C = await getDb();
+  const q = f.q.trim();
+  const digits = q.replace(/\D/g, "");
+
+  // Sales in scope (brand, own-sales-only, agent filter) → their invoices.
+  const saleConds: Filter<RowOf<"sales">>[] = [scopeSales(viewer, f.brand)];
+  if (f.agent && can(viewer, "sales.view_all")) saleConds.push({ agentId: f.agent });
+  const saleIds = await C.sales.distinct("id", { $and: saleConds });
+
+  const conds: Filter<RowOf<"invoices">>[] = [{ saleId: { $in: ids(saleIds) } }];
+  if (q) {
+    const rx = contains(q);
+    const customerOr: Filter<RowOf<"customers">>[] = [{ fullName: rx }, { email: rx }];
+    if (digits.length >= 4) customerOr.push({ phoneNormalized: contains(digits) });
+    const [customerIds, byPayment] = await Promise.all([
+      C.customers.distinct("id", { $or: customerOr }),
+      C.transactions.distinct("invoiceId", { $or: [{ paymentReference: rx }, { id: rx }] }),
+    ]);
+    conds.push({
+      $or: [
+        { customerId: { $in: customerIds } },
+        { invoiceNumber: rx },
+        { sourceRecordId: rx },
+        { saleId: rx },
+        { id: { $in: uniq(byPayment) } },
+      ],
+    });
+  }
+  const where = { $and: conds };
+
+  // Newest sale first (sale dates live on the sales documents), then invoice id; paged in the database.
+  const [sorted, total] = await Promise.all([
+    C.invoices
+      .aggregate<RowOf<"invoices">>([
+        { $match: where },
+        { $lookup: { from: "sales", localField: "saleId", foreignField: "id", pipeline: [{ $project: { _id: 0, saleDate: 1 } }], as: "_sale" } },
+        { $set: { _saleDate: { $first: "$_sale.saleDate" } } },
+        { $sort: { _saleDate: -1, id: -1 } },
+        { $skip: (f.page - 1) * ORDERS_PAGE_SIZE },
+        { $limit: ORDERS_PAGE_SIZE },
+        { $project: { _id: 0, _sale: 0, _saleDate: 0 } },
+      ])
+      .toArray(),
+    C.invoices.countDocuments(where),
   ]);
+  const pageSales = byKey(
+    await C.sales.find({ id: { $in: ids(uniq(sorted.map((i) => i.saleId))) } }, { projection: { id: 1, saleDate: 1, createdAt: 1, brandId: 1, agentId: 1 } }).toArray(),
+    "id",
+  );
+
+  const invoiceIds = sorted.map((i) => i.id);
+  const [custs, people, items, payments, cbCounts] = await Promise.all([
+    C.customers.find({ id: { $in: ids(uniq(sorted.map((i) => i.customerId))) } }, { projection: { id: 1, fullName: 1, email: 1, phone: 1 } }).toArray(),
+    C.users.find({ id: { $in: ids(uniq(sorted.map((i) => pageSales.get(i.saleId)?.agentId))) } }, { projection: { id: 1, name: 1 } }).toArray(),
+    C.saleItems.find({ saleId: { $in: ids(sorted.map((i) => i.saleId)) } }, { sort: { id: 1 }, projection: { saleId: 1, description: 1 } }).toArray(),
+    C.transactions
+      .find({ invoiceId: { $in: ids(invoiceIds) }, type: "payment", status: "succeeded" }, { sort: { occurredAt: -1 }, projection: { id: 1, invoiceId: 1, paymentReference: 1 } })
+      .toArray(),
+    C.chargebackCases.aggregate<{ _id: string; n: number }>([{ $match: { invoiceId: { $in: ids(invoiceIds) } } }, { $group: { _id: "$invoiceId", n: { $sum: 1 } } }]).toArray(),
+  ]);
+  const customerMap = byKey(custs, "id");
+  const userMap = byKey(people, "id");
+  const firstItem = new Map<string, string>();
+  for (const it of items) if (!firstItem.has(it.saleId)) firstItem.set(it.saleId, it.description);
+  const latestPayment = new Map<string, (typeof payments)[number]>();
+  for (const pmt of payments) if (pmt.invoiceId && !latestPayment.has(pmt.invoiceId)) latestPayment.set(pmt.invoiceId, pmt);
+
+  const rows = sorted.filter((i) => pageSales.has(i.saleId)).map((i) => {
+    const s = pageSales.get(i.saleId)!;
+    const c = customerMap.get(i.customerId);
+    const pay = latestPayment.get(i.id);
+    return {
+      invoiceId: i.id,
+      invoiceNumber: i.invoiceNumber,
+      agentInvoiceNumber: i.sourceRecordId,
+      status: i.status,
+      total: i.total,
+      amountPaid: i.amountPaid,
+      currency: i.currency,
+      paymentMethod: i.paymentMethod,
+      billingDate: i.billingDate,
+      saleId: s.id,
+      createdAt: s.createdAt,
+      brandId: s.brandId,
+      agentId: s.agentId,
+      agentName: userMap.get(s.agentId)?.name ?? null,
+      description: firstItem.get(s.id) ?? null,
+      customerId: i.customerId,
+      customerName: c?.fullName ?? "",
+      customerEmail: c?.email ?? null,
+      customerPhone: c?.phone ?? null,
+      billingAddress: i.billingAddress,
+      paymentId: pay?.id ?? null,
+      paymentReference: pay?.paymentReference ?? null,
+      chargebacks: cbCounts.find((x) => x._id === i.id)?.n ?? 0,
+    };
+  });
   return { rows, total };
 }

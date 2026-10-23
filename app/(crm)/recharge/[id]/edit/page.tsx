@@ -8,7 +8,6 @@ import { getCaseDetail } from "@/lib/data/chargebacks";
 import { getViewerBrands } from "@/lib/data/reference";
 import { evaluate } from "@/lib/domain/chargeback-workflow";
 import { readPolicy } from "@/lib/services/chargebacks";
-import { getDb } from "@/lib/db";
 import { maskReference } from "@/lib/mask";
 import { toCents } from "@/lib/money";
 
@@ -21,7 +20,7 @@ export default async function EditCasePage(props: PageProps<"/recharge/[id]/edit
   const detail = await getCaseDetail(viewer, id);
   if (!detail) return <AccessDenied />;
   const { case: c, original, invoice, customer, balance } = detail;
-  const policy = await readPolicy(await getDb());
+  const policy = await readPolicy();
   const check = evaluate("edit", viewer, c, policy);
   if (!check.allowed || !original) return <AccessDenied message={check.reason ?? "This case cannot be edited."} />;
   const brands = await getViewerBrands(viewer, { activeOnly: true });

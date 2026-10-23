@@ -1,17 +1,20 @@
 /**
- * Unified CRM — relational schema (PostgreSQL).
+ * Unified CRM — document schema.
  *
- * Runs on PGlite (embedded Postgres) for the demo and on any PostgreSQL 15+
- * server in production; the generated migrations in /drizzle are portable.
+ * Stored in MongoDB, one collection per table below (collection name = table
+ * name). The Drizzle column builders are used only to describe each document's
+ * fields, types and defaults: the app's TypeScript types come from here, and
+ * lib/db/collections.ts applies the defaults on insert. No SQL is involved.
  *
  * Conventions
- * - Stable, human-readable text primary keys (CUS-100001, INV numbers, …) that
- *   never change once issued.
- * - Money is numeric(14,2) + an explicit ISO-4217 currency column. Application
- *   code converts to integer cents before doing arithmetic (lib/money.ts).
- * - All timestamps are timestamptz (UTC).
- * - Financial history is append-only: transactions, chargeback_events and
- *   activity_logs are protected by triggers (see drizzle/0001_*.sql).
+ * - Stable, human-readable string ids (CUS-100001, INV numbers, …) that never
+ *   change once issued; composite keys get a unique index (lib/db/indexes.ts).
+ * - Money is a decimal string ("1234.50") plus an explicit ISO-4217 currency.
+ *   Application code converts to integer cents before doing arithmetic
+ *   (lib/money.ts); aggregations sum exact Decimal128 values.
+ * - All timestamps are Dates (UTC).
+ * - Financial history is append-only: transactions, chargeback_events,
+ *   customer_merge_history and activity_logs are protected in lib/db/collections.ts.
  */
 import { sql } from "drizzle-orm";
 import {

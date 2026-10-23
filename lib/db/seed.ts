@@ -12,7 +12,7 @@
  *   6 customers · 6 sales · 6 invoices · 4 payments · 2 recharge / chargeback cases
  */
 import bcrypt from "bcryptjs";
-import type { DB } from "./client";
+import type { Collections, InsertOf, TableKey } from "./collections";
 import * as s from "./schema";
 import { ALL_PERMISSIONS, PERMISSIONS, ROLES } from "../domain/permissions";
 import { fromCents, percentOf, toCents } from "../money";
@@ -104,7 +104,11 @@ const SALES: {
 
 /* ------------------------------------------------------------------ seed */
 
-export async function seedDatabase(db: DB) {
+export async function seedDatabase(C: Collections) {
+  const ins = async <K extends TableKey>(k: K, v: InsertOf<K> | InsertOf<K>[]) => {
+    if (Array.isArray(v)) await C[k].insertMany(v);
+    else await C[k].insertOne(v);
+  };
   const now = new Date();
   const at = (daysAgo: number, hour = 10) => {
     const d = new Date(now.getTime() - daysAgo * DAY);
@@ -114,42 +118,42 @@ export async function seedDatabase(db: DB) {
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
 
   /* RBAC — exactly two roles */
-  await db.insert(s.permissions).values(
+  await ins("permissions", 
     ALL_PERMISSIONS.map((key) => {
       const p = PERMISSIONS[key] as { module: string; description: string; sensitive?: boolean };
       return { key, module: p.module, description: p.description, sensitive: !!p.sensitive };
     }),
   );
   for (const [id, role] of Object.entries(ROLES)) {
-    await db.insert(s.roles).values({ id, name: role.name, description: role.description });
-    await db.insert(s.rolePermissions).values(role.permissions.map((permissionKey) => ({ roleId: id, permissionKey })));
+    await ins("roles", { id, name: role.name, description: role.description });
+    await ins("rolePermissions", role.permissions.map((permissionKey) => ({ roleId: id, permissionKey })));
   }
 
   /* Brands, legal entities, mapping, products */
-  await db.insert(s.brands).values(BRANDS.map((b) => ({ ...b, allowedPaymentMethods: [...b.allowedPaymentMethods], allowedCurrencies: ["USD"], defaultCurrency: "USD" })));
-  await db.insert(s.legalEntities).values(
+  await ins("brands", BRANDS.map((b) => ({ ...b, allowedPaymentMethods: [...b.allowedPaymentMethods], allowedCurrencies: ["USD"], defaultCurrency: "USD" })));
+  await ins("legalEntities", 
     ENTITIES.map((e) => ({ id: e.id, registeredName: e.registeredName, internalCode: e.internalCode, jurisdiction: e.jurisdiction, permittedTransactionTypes: e.types, notes: e.notes })),
   );
   const effectiveFrom = `${now.getUTCFullYear() - 1}-01-01`;
-  await db.insert(s.brandLegalEntities).values(
+  await ins("brandLegalEntities", 
     MAPPINGS.map((m) => ({ ...m, effectiveFrom, notes: ("notes" in m ? m.notes : undefined) ?? "Demo assumption — confirm with finance.", createdBy: null })),
   );
-  await db.insert(s.productsServices).values(PRODUCTS.map((p) => ({ id: p.id, brandId: p.brandId, sku: p.sku, name: p.name, category: p.category, unitPrice: p.price, currency: "USD", taxable: p.taxable })));
+  await ins("productsServices", PRODUCTS.map((p) => ({ id: p.id, brandId: p.brandId, sku: p.sku, name: p.name, category: p.category, unitPrice: p.price, currency: "USD", taxable: p.taxable })));
 
   /* Users: 1 Super Admin + 2 Sales Agents */
-  await db.insert(s.users).values(
+  await ins("users", 
     USERS.map((u, i) => ({ id: u.id, email: u.email, name: u.name, passwordHash, status: "active" as const, createdAt: at(90 - i), updatedAt: at(90 - i) })),
   );
-  await db.insert(s.userRoles).values(USERS.map((u) => ({ userId: u.id, roleId: u.role })));
-  await db.insert(s.userBrandAccess).values(USERS.flatMap((u) => u.brands.map((brandId) => ({ userId: u.id, brandId, grantedBy: ADMIN }))));
-  await db.insert(s.salesAgents).values(
+  await ins("userRoles", USERS.map((u) => ({ userId: u.id, roleId: u.role })));
+  await ins("userBrandAccess", USERS.flatMap((u) => u.brands.map((brandId) => ({ userId: u.id, brandId, grantedBy: ADMIN }))));
+  await ins("salesAgents", 
     USERS.filter((u) => u.role === "sales_agent").map((u) => ({
       userId: u.id, agentCode: u.agentCode!, team: "Sales", monthlyTarget: "25000.00", hireDate: isoDate(at(400)), managerId: ADMIN,
     })),
   );
 
   /* Customers (each linked to its first brand; one is also linked to a second brand) */
-  await db.insert(s.customers).values(
+  await ins("customers", 
     CUSTOMERS.map((c) => ({
       id: c.id, fullName: c.fullName, email: c.email,
       phone: c.phone.startsWith("44") ? `+44 ${c.phone.slice(2, 4)} ${c.phone.slice(4, 8)} ${c.phone.slice(8)}` : `+1 (${c.phone.slice(1, 4)}) ${c.phone.slice(4, 7)}-${c.phone.slice(7)}`,
@@ -159,12 +163,12 @@ export async function seedDatabase(db: DB) {
       tags: [...c.tags], createdBy: c.agent, createdAt: at(c.daysAgo), updatedAt: at(c.daysAgo), lastActivityAt: at(c.daysAgo),
     })),
   );
-  await db.insert(s.customerBrandRelationships).values(
+  await ins("customerBrandRelationships", 
     CUSTOMERS.flatMap((c) => [c.brand, ...c.extraBrands].map((brandId, i) => ({ customerId: c.id, brandId, firstSeenAt: at(c.daysAgo - i * 5) }))),
   );
 
   /* Sales → invoices → payments */
-  const activity: (typeof s.activityLogs.$inferInsert)[] = [];
+  const activity: InsertOf<"activityLogs">[] = [];
   const payments = new Map<number, string>();
   const brandSeq = new Map<string, number>();
   let txnN = 0;
@@ -183,23 +187,23 @@ export async function seedDatabase(db: DB) {
     const total = gross - discount + tax;
     const paid = sale.status === "paid" ? total : (sale.paidCents ?? 0);
 
-    await db.insert(s.sales).values({
+    await ins("sales", {
       id: saleId, brandId: brand.id, customerId: customer.id, agentId: sale.agent, legalEntityId: sale.entity, saleDate, currency: "USD",
       subtotal: fromCents(gross), discount: fromCents(discount), tax: fromCents(tax), total: fromCents(total),
       status: "completed", createdBy: sale.agent, createdAt: saleDate,
     });
-    await db.insert(s.saleItems).values({
+    await ins("saleItems", {
       id: `SIT-${String(sale.n).padStart(6, "0")}`, saleId, productId: product.id, description: product.name, quantity: sale.qty,
       unitPrice: product.price, discount: fromCents(discount), taxRate: product.taxable ? brand.defaultTaxRate : "0", lineTotal: fromCents(total),
     });
-    await db.insert(s.invoices).values({
+    await ins("invoices", {
       id: invoiceId, invoiceNumber: `${brand.invoicePrefix}-${saleDate.getUTCFullYear()}-${String(seq).padStart(6, "0")}`, saleId,
       brandId: brand.id, customerId: customer.id, legalEntityId: sale.entity, agentId: sale.agent, billingDate: saleDate,
       dueDate: new Date(saleDate.getTime() + brand.paymentTermsDays * DAY), billingAddress: `${100 + Number(customer.id.slice(-1)) * 11} Market Street, ${customer.city}`,
       currency: "USD", subtotal: fromCents(gross), discount: fromCents(discount), tax: fromCents(tax), total: fromCents(total), amountPaid: fromCents(paid),
       status: sale.status, paymentMethod: sale.method as never, createdBy: sale.agent, createdAt: saleDate, updatedAt: saleDate,
     });
-    await db.insert(s.invoiceItems).values({
+    await ins("invoiceItems", {
       id: `IIT-${String(sale.n).padStart(6, "0")}`, invoiceId, saleItemId: `SIT-${String(sale.n).padStart(6, "0")}`, description: product.name,
       quantity: sale.qty, unitPrice: product.price, lineTotal: fromCents(total),
     });
@@ -211,7 +215,7 @@ export async function seedDatabase(db: DB) {
       const txnId = `TXN-${500000 + ++txnN}`;
       payments.set(sale.n, txnId);
       const paidAt = new Date(saleDate.getTime() + 2 * 3600_000);
-      await db.insert(s.transactions).values({
+      await ins("transactions", {
         id: txnId, type: "payment", status: "succeeded", brandId: brand.id, legalEntityId: sale.entity, customerId: customer.id, invoiceId,
         amount: fromCents(paid), currency: "USD", paymentMethod: sale.method as never,
         processor: sale.method === "card" ? "Stripe (demo)" : "Bank (demo)", paymentReference: sale.ref!, occurredAt: paidAt,
@@ -231,12 +235,12 @@ export async function seedDatabase(db: DB) {
   const case1 = `RCB-${year}-0001`;
   const c1Req = at(12), c1Rev = at(11), c1Appr = at(10), c1Proc = at(10, 14), c1Done = at(5);
   const c1Ledger = `TXN-${500000 + ++txnN}`;
-  await db.insert(s.transactions).values({
+  await ins("transactions", {
     id: c1Ledger, type: "chargeback", status: "succeeded", brandId: "BRD-XPC", legalEntityId: "LLC-002", customerId: "CUS-100003", invoiceId: "INV-300003",
     relatedTransactionId: payments.get(3)!, chargebackCaseId: case1, amount: "1000.00", currency: "USD", processor: "Stripe (demo)",
     paymentReference: "dp_demo_XPC0001", occurredAt: c1Done, notes: "Handled by LLC-003; booked against original entity LLC-002.", createdBy: ADMIN, createdAt: c1Done,
   });
-  await db.insert(s.chargebackCases).values({
+  await ins("chargebackCases", {
     id: case1, caseType: "chargeback", origin: "processor", brandId: "BRD-XPC", customerId: "CUS-100003", invoiceId: "INV-300003",
     originalTransactionId: payments.get(3)!, originalLegalEntityId: "LLC-002", responsibleLegalEntityId: "LLC-003", amount: "1000.00", currency: "USD",
     reasonCode: "13.3", notes: "Customer disputes the final edit as not matching the agreed storyboard.", requestDate: c1Req, requestedBy: AGENT1,
@@ -247,13 +251,13 @@ export async function seedDatabase(db: DB) {
   // 2) Pending review: CoreByte cloud migration, requested by agent 2 — awaiting the Super Admin.
   const case2 = `RCB-${year}-0002`;
   const c2Req = at(2), c2Sub = at(2, 11);
-  await db.insert(s.chargebackCases).values({
+  await ins("chargebackCases", {
     id: case2, caseType: "chargeback", origin: "crm", brandId: "BRD-CBT", customerId: "CUS-100005", invoiceId: "INV-300005",
     originalTransactionId: payments.get(5)!, originalLegalEntityId: "LLC-001", responsibleLegalEntityId: "LLC-001", amount: "2500.00", currency: "USD",
     reasonCode: "13.1", notes: "Customer reports the second migration phase was not delivered.", requestDate: c2Req, requestedBy: AGENT2,
     status: "pending_review", createdAt: c2Req, updatedAt: c2Sub,
   });
-  await db.insert(s.chargebackEvents).values([
+  await ins("chargebackEvents", [
     { caseId: case1, action: "created", toStatus: "draft", actorId: AGENT1, note: "Recorded from processor case dp_demo_XPC0001", createdAt: c1Req },
     { caseId: case1, action: "submitted", fromStatus: "draft", toStatus: "pending_review", actorId: AGENT1, createdAt: c1Req },
     { caseId: case1, action: "reviewed", fromStatus: "pending_review", toStatus: "pending_approval", actorId: ADMIN, note: "Evidence verified.", createdAt: c1Rev },
@@ -271,14 +275,14 @@ export async function seedDatabase(db: DB) {
   );
 
   /* A single useful note, two useful notifications */
-  await db.insert(s.notes).values({ id: "NOTE-00001", entityType: "customer", entityId: "CUS-100002", body: "Interested in an Xpectra social media package next quarter.", authorId: AGENT1, createdAt: at(20) });
-  await db.insert(s.notifications).values([
+  await ins("notes", { id: "NOTE-00001", entityType: "customer", entityId: "CUS-100002", body: "Interested in an Xpectra social media package next quarter.", authorId: AGENT1, createdAt: at(20) });
+  await ins("notifications", [
     { id: "NTF-000001", userId: ADMIN, kind: "approval_needed", title: `Review requested: ${case2}`, body: "2,500.00 USD recharge / chargeback awaiting review.", href: `/recharge/${case2}`, createdAt: c2Sub },
     { id: "NTF-000002", userId: AGENT1, kind: "case_update", title: `${case1} completed`, body: "Your request was completed.", href: `/recharge/${case1}`, createdAt: c1Done },
   ]);
 
   /* Integration placeholders for the three brand systems (simulated; no runs yet) */
-  await db.insert(s.integrationSources).values(
+  await ins("integrationSources", 
     BRANDS.map((b) => ({
       id: `INT-${b.code}`, brandId: b.id, domain: b.domain, systemName: `${b.name} billing database`, status: "demo_not_connected" as const,
       config: { mode: "pull", schedule: "manual", entities: ["customers", "invoices", "payments", "chargebacks"], dryRunFirst: true, batchSize: 500, credentialsRef: `env:${b.code}_SOURCE_DATABASE_URL` },
@@ -291,9 +295,9 @@ export async function seedDatabase(db: DB) {
     { actorId: ADMIN, action: "user.created", entityType: "user", entityId: AGENT2, summary: "User Emily Carter <agent2@crm.demo> created as Sales Agent", createdAt: at(88) },
   );
   activity.sort((a, b) => (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime());
-  await db.insert(s.activityLogs).values(activity);
+  await ins("activityLogs", activity);
 
-  await db.insert(s.systemSettings).values([
+  await ins("systemSettings", [
     { key: "chargeback.require_independent_approval", value: true, description: "Requesters cannot approve their own recharge / chargeback requests." },
     { key: "chargeback.require_independent_review", value: true, description: "Requesters cannot review their own requests." },
     { key: "chargeback.allow_partial", value: true, description: "Allow chargebacks for less than the original amount." },
@@ -309,7 +313,7 @@ export async function seedDatabase(db: DB) {
     name: `invnum:${b.invoicePrefix}:${year}`,
     value: SALES.filter((x) => x.brand === b.id && at(x.daysAgo).getUTCFullYear() === year).length,
   })).filter((c) => c.value > 0);
-  await db.insert(s.idCounters).values([
+  await ins("idCounters", [
     { name: "user", value: USERS.length },
     { name: "customer", value: CUSTOMERS.length },
     { name: "sale", value: SALES.length },

@@ -1,92 +1,117 @@
 import "server-only";
-import { and, asc, count, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
-import { getDb } from "@/lib/db";
-import {
-  activityLogs,
-  brands,
-  chargebackCases,
-  customers,
-  financialAdjustments,
-  invoiceItems,
-  invoices,
-  legalEntities,
-  saleItems,
-  sales,
-  transactions,
-  users,
-} from "@/lib/db/schema";
-import { brandFilter, scopeCases, scopeInvoices } from "@/lib/auth/scope";
+import type { Filter } from "mongodb";
+import { getDb, type RowOf } from "@/lib/db";
+import { byKey, contains, dec, decStr, ids, sumDec, uniq } from "@/lib/db/query";
+import { scopeCases, scopeInvoices } from "@/lib/auth/scope";
 import { can, type Viewer } from "@/lib/auth/viewer";
 import { PAGE_SIZE, type ListFilters } from "@/lib/filters";
-import { toCents } from "@/lib/money";
+import { fromCents, toCents } from "@/lib/money";
 
-/** Approved adjustments per invoice — they reduce the balance due but never amount_paid. */
-export const approvedAdjSql = sql<string>`coalesce((select sum(fa.amount) from ${financialAdjustments} fa where fa.invoice_id = ${invoices.id} and fa.status = 'approved'), 0)`;
-/** Adjusted balance = max(0, total − paid − approved adjustments). */
-export const balanceSql = sql<string>`greatest(0, ${invoices.total} - ${invoices.amountPaid} - ${approvedAdjSql})`;
+type Invoice = RowOf<"invoices">;
 
-export function invoiceListWhere(viewer: Viewer, f: ListFilters) {
+/** Approved adjustments per invoice (cents) — they reduce the balance due but never amount_paid. */
+export async function approvedAdjustmentsByInvoice(invoiceIds: string[]): Promise<Map<string, number>> {
+  const C = await getDb();
+  const rows = await C.financialAdjustments
+    .aggregate<{ _id: string; total: unknown }>([
+      { $match: { invoiceId: { $in: ids(invoiceIds) }, status: "approved" } },
+      { $group: { _id: "$invoiceId", total: sumDec("$amount") } },
+    ])
+    .toArray();
+  return new Map(rows.map((r) => [r._id, toCents(decStr(r.total))]));
+}
+
+/** Adjusted balance = max(0, total − paid − approved adjustments), in cents. */
+export const invoiceBalanceCents = (inv: Pick<Invoice, "total" | "amountPaid">, adjustedCents: number) =>
+  Math.max(0, toCents(inv.total) - toCents(inv.amountPaid) - adjustedCents);
+
+/** Adds `adjusted` and `balance` (decimal strings) to invoice rows. */
+export async function withBalances<T extends Pick<Invoice, "id" | "total" | "amountPaid">>(rows: T[]) {
+  const adj = await approvedAdjustmentsByInvoice(rows.map((r) => r.id));
+  return rows.map((r) => {
+    const a = adj.get(r.id) ?? 0;
+    return { ...r, adjusted: fromCents(a), balance: fromCents(invoiceBalanceCents(r, a)) };
+  });
+}
+
+/** Aggregation stages adding `adjDec` and `balanceDec` (Decimal128) to invoice documents. */
+export const balanceStages = [
+  {
+    $lookup: {
+      from: "financial_adjustments",
+      let: { invId: "$id" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$invoiceId", "$$invId"] }, status: "approved" } },
+        { $group: { _id: null, s: sumDec("$amount") } },
+      ],
+      as: "_adj",
+    },
+  },
+  { $set: { adjDec: { $ifNull: [{ $first: "$_adj.s" }, dec("0")] } } },
+  { $set: { balanceDec: { $max: [dec("0"), { $subtract: [dec("$total"), { $add: [dec("$amountPaid"), "$adjDec"] }] }] } } },
+  { $unset: "_adj" },
+];
+
+export async function invoiceListWhere(viewer: Viewer, f: ListFilters): Promise<Filter<Invoice>> {
+  const C = await getDb();
   const q = f.q.trim();
-  const like = `%${q.replace(/[%_]/g, "")}%`;
-  return and(
-    scopeInvoices(viewer, f.brand),
-    q
-      ? or(
-          ilike(invoices.invoiceNumber, like),
-          ilike(invoices.id, like),
-          ilike(invoices.customerId, like),
-          ilike(customers.fullName, like),
-          ilike(customers.companyName, like),
-          can(viewer, "transactions.view")
-            ? sql`exists (select 1 from ${transactions} t where t.invoice_id = ${invoices.id} and t.payment_reference ilike ${like})`
-            : undefined,
-        )
-      : undefined,
-    f.status ? eq(invoices.status, f.status as never) : undefined,
-    f.agent ? eq(invoices.agentId, f.agent) : undefined,
-    f.entity ? eq(invoices.legalEntityId, f.entity) : undefined,
-    f.customer ? eq(invoices.customerId, f.customer) : undefined,
-    f.from ? sql`${invoices.billingDate} >= ${f.from}` : undefined,
-    f.to ? sql`${invoices.billingDate} <= ${f.to}` : undefined,
-  );
+  const conds: Filter<Invoice>[] = [scopeInvoices(viewer, f.brand)];
+  if (q) {
+    const rx = contains(q);
+    const customerIds = await C.customers.distinct("id", { $or: [{ fullName: rx }, { companyName: rx }] });
+    const alternatives: Filter<Invoice>[] = [{ invoiceNumber: rx }, { id: rx }, { customerId: rx }, { customerId: { $in: customerIds } }];
+    if (can(viewer, "transactions.view")) {
+      const byRef = await C.transactions.distinct("invoiceId", { paymentReference: rx });
+      alternatives.push({ id: { $in: uniq(byRef) } });
+    }
+    conds.push({ $or: alternatives });
+  }
+  if (f.status) conds.push({ status: f.status as Invoice["status"] });
+  if (f.agent) conds.push({ agentId: f.agent });
+  if (f.entity) conds.push({ legalEntityId: f.entity });
+  if (f.customer) conds.push({ customerId: f.customer });
+  if (f.from) conds.push({ billingDate: { $gte: f.from } });
+  if (f.to) conds.push({ billingDate: { $lte: f.to } });
+  return { $and: conds };
 }
 
 export async function listInvoices(viewer: Viewer, f: ListFilters) {
-  const db = await getDb();
-  const where = invoiceListWhere(viewer, f);
-  const [rows, [{ total }]] = await Promise.all([
-    db
-      .select({
-        id: invoices.id,
-        invoiceNumber: invoices.invoiceNumber,
-        brandId: invoices.brandId,
-        customerId: invoices.customerId,
-        customerName: customers.fullName,
-        companyName: customers.companyName,
-        agentId: invoices.agentId,
-        agentName: users.name,
-        legalEntityId: invoices.legalEntityId,
-        entityCode: legalEntities.internalCode,
-        billingDate: invoices.billingDate,
-        dueDate: invoices.dueDate,
-        total: invoices.total,
-        amountPaid: invoices.amountPaid,
-        adjusted: approvedAdjSql,
-        balance: balanceSql,
-        currency: invoices.currency,
-        status: invoices.status,
-        paymentMethod: invoices.paymentMethod,
-      })
-      .from(invoices)
-      .innerJoin(customers, eq(customers.id, invoices.customerId))
-      .leftJoin(users, eq(users.id, invoices.agentId))
-      .leftJoin(legalEntities, eq(legalEntities.id, invoices.legalEntityId))
-      .where(where)
-      .orderBy(desc(invoices.billingDate), desc(invoices.id))
-      .limit(PAGE_SIZE)
-      .offset((f.page - 1) * PAGE_SIZE),
-    db.select({ total: count() }).from(invoices).innerJoin(customers, eq(customers.id, invoices.customerId)).where(where),
+  const C = await getDb();
+  const where = await invoiceListWhere(viewer, f);
+  const [page, total] = await Promise.all([
+    C.invoices.find(where, { sort: { billingDate: -1, id: -1 }, skip: (f.page - 1) * PAGE_SIZE, limit: PAGE_SIZE }).toArray(),
+    C.invoices.countDocuments(where),
   ]);
+  const [people, entities, custs, withBal] = await Promise.all([
+    C.users.find({ id: { $in: ids(uniq(page.map((i) => i.agentId))) } }, { projection: { id: 1, name: 1 } }).toArray(),
+    C.legalEntities.find({ id: { $in: ids(uniq(page.map((i) => i.legalEntityId))) } }, { projection: { id: 1, internalCode: 1 } }).toArray(),
+    C.customers.find({ id: { $in: ids(uniq(page.map((i) => i.customerId))) } }, { projection: { id: 1, fullName: 1, companyName: 1 } }).toArray(),
+    withBalances(page),
+  ]);
+  const userMap = byKey(people, "id");
+  const entityMap = byKey(entities, "id");
+  const customerMap = byKey(custs, "id");
+  const rows = withBal.map((i) => ({
+    id: i.id,
+    invoiceNumber: i.invoiceNumber,
+    brandId: i.brandId,
+    customerId: i.customerId,
+    customerName: customerMap.get(i.customerId)?.fullName ?? "",
+    companyName: customerMap.get(i.customerId)?.companyName ?? null,
+    agentId: i.agentId,
+    agentName: userMap.get(i.agentId)?.name ?? null,
+    legalEntityId: i.legalEntityId,
+    entityCode: entityMap.get(i.legalEntityId)?.internalCode ?? null,
+    billingDate: i.billingDate,
+    dueDate: i.dueDate,
+    total: i.total,
+    amountPaid: i.amountPaid,
+    adjusted: i.adjusted,
+    balance: i.balance,
+    currency: i.currency,
+    status: i.status,
+    paymentMethod: i.paymentMethod,
+  }));
   return { rows, total };
 }
 
@@ -98,129 +123,125 @@ export async function listInvoices(viewer: Viewer, f: ListFilters) {
  * - Pending / Draft: number of invoices awaiting issue or payment.
  */
 export async function invoiceKpis(viewer: Viewer, f: ListFilters) {
-  const db = await getDb();
-  const [row] = await db
-    .select({
-      billed: sql<string>`coalesce(sum(${invoices.total}) filter (where ${invoices.status} not in ('draft','cancelled')), 0)`,
-      collected: sql<string>`coalesce(sum(${invoices.amountPaid}), 0)`,
-      outstanding: sql<string>`coalesce(sum(${balanceSql}) filter (where ${invoices.status} in ('pending','partially_paid','overdue')), 0)`,
-      overdueCount: sql<number>`count(*) filter (where ${invoices.status} = 'overdue')::int`,
-      pendingCount: sql<number>`count(*) filter (where ${invoices.status} = 'pending')::int`,
-      draftCount: sql<number>`count(*) filter (where ${invoices.status} = 'draft')::int`,
-      n: sql<number>`count(*)::int`,
-    })
-    .from(invoices)
-    .innerJoin(customers, eq(customers.id, invoices.customerId))
-    .where(invoiceListWhere(viewer, f));
+  const C = await getDb();
+  const is = (statuses: string[]) => ({ $in: ["$status", statuses] });
+  const countIf = (cond: unknown) => ({ $sum: { $cond: [cond, 1, 0] } });
+  const [row] = await C.invoices
+    .aggregate<Record<string, unknown>>([
+      { $match: await invoiceListWhere(viewer, f) },
+      ...balanceStages,
+      {
+        $group: {
+          _id: null,
+          billed: { $sum: { $cond: [is(["draft", "cancelled"]), dec("0"), dec("$total")] } },
+          collected: sumDec("$amountPaid"),
+          outstanding: { $sum: { $cond: [is(["pending", "partially_paid", "overdue"]), "$balanceDec", dec("0")] } },
+          overdueCount: countIf({ $eq: ["$status", "overdue"] }),
+          pendingCount: countIf({ $eq: ["$status", "pending"] }),
+          draftCount: countIf({ $eq: ["$status", "draft"] }),
+          n: { $sum: 1 },
+        },
+      },
+    ])
+    .toArray();
   return {
-    billed: toCents(row.billed),
-    collected: toCents(row.collected),
-    outstanding: toCents(row.outstanding),
-    overdueCount: Number(row.overdueCount),
-    pendingCount: Number(row.pendingCount),
-    draftCount: Number(row.draftCount),
-    n: Number(row.n),
+    billed: toCents(decStr(row?.billed)),
+    collected: toCents(decStr(row?.collected)),
+    outstanding: toCents(decStr(row?.outstanding)),
+    overdueCount: Number(row?.overdueCount ?? 0),
+    pendingCount: Number(row?.pendingCount ?? 0),
+    draftCount: Number(row?.draftCount ?? 0),
+    n: Number(row?.n ?? 0),
   };
 }
 
 export async function getInvoiceDetail(viewer: Viewer, id: string) {
-  const db = await getDb();
-  const [inv] = await db
-    .select({
-      invoice: invoices,
-      customerName: customers.fullName,
-      customerCompany: customers.companyName,
-      customerEmail: customers.email,
-      agentName: users.name,
-      agentEmail: users.email,
-      entityName: legalEntities.registeredName,
-      entityCode: legalEntities.internalCode,
-      entityJurisdiction: legalEntities.jurisdiction,
-      brandName: brands.name,
-      allowedPaymentMethods: brands.allowedPaymentMethods,
-      saleDate: sales.saleDate,
-      saleStatus: sales.status,
-      saleNotes: sales.notes,
-    })
-    .from(invoices)
-    .innerJoin(customers, eq(customers.id, invoices.customerId))
-    .innerJoin(brands, eq(brands.id, invoices.brandId))
-    .innerJoin(sales, eq(sales.id, invoices.saleId))
-    .leftJoin(users, eq(users.id, invoices.agentId))
-    .leftJoin(legalEntities, eq(legalEntities.id, invoices.legalEntityId))
-    .where(and(eq(invoices.id, id), scopeInvoices(viewer)))
-    .limit(1);
-  if (!inv) return null;
-  const invoice = inv.invoice;
-
-  const [items, saleLines, ledger, cases, adjustments, activity] = await Promise.all([
-    db.select().from(invoiceItems).where(eq(invoiceItems.invoiceId, id)).orderBy(asc(invoiceItems.id)),
-    db.select().from(saleItems).where(eq(saleItems.saleId, invoice.saleId)).orderBy(asc(saleItems.id)),
-    db
-      .select({
-        id: transactions.id,
-        type: transactions.type,
-        status: transactions.status,
-        amount: transactions.amount,
-        currency: transactions.currency,
-        paymentMethod: transactions.paymentMethod,
-        processor: transactions.processor,
-        paymentReference: transactions.paymentReference,
-        occurredAt: transactions.occurredAt,
-        relatedTransactionId: transactions.relatedTransactionId,
-        chargebackCaseId: transactions.chargebackCaseId,
-        adjustmentId: transactions.adjustmentId,
-        notes: transactions.notes,
-        createdByName: users.name,
-      })
-      .from(transactions)
-      .leftJoin(users, eq(users.id, transactions.createdBy))
-      .where(eq(transactions.invoiceId, id))
-      .orderBy(asc(transactions.occurredAt), asc(transactions.id)),
-    can(viewer, "chargebacks.view")
-      ? db
-          .select({
-            id: chargebackCases.id,
-            caseType: chargebackCases.caseType,
-            status: chargebackCases.status,
-            amount: chargebackCases.amount,
-            currency: chargebackCases.currency,
-            reasonCode: chargebackCases.reasonCode,
-            requestDate: chargebackCases.requestDate,
-          })
-          .from(chargebackCases)
-          .where(and(eq(chargebackCases.invoiceId, id), scopeCases(viewer)))
-          .orderBy(desc(chargebackCases.requestDate))
-      : Promise.resolve([]),
-    db
-      .select({
-        id: financialAdjustments.id,
-        type: financialAdjustments.type,
-        status: financialAdjustments.status,
-        amount: financialAdjustments.amount,
-        currency: financialAdjustments.currency,
-        reason: financialAdjustments.reason,
-        createdAt: financialAdjustments.createdAt,
-        requestedByName: users.name,
-      })
-      .from(financialAdjustments)
-      .leftJoin(users, eq(users.id, financialAdjustments.requestedBy))
-      .where(eq(financialAdjustments.invoiceId, id))
-      .orderBy(desc(financialAdjustments.createdAt)),
-    db
-      .select({ id: activityLogs.id, action: activityLogs.action, summary: activityLogs.summary, createdAt: activityLogs.createdAt, actor: users.name })
-      .from(activityLogs)
-      .leftJoin(users, eq(users.id, activityLogs.actorId))
-      .where(
-        or(
-          and(eq(activityLogs.entityType, "invoice"), eq(activityLogs.entityId, id)),
-          and(eq(activityLogs.entityType, "sale"), eq(activityLogs.entityId, invoice.saleId)),
-          sql`${activityLogs.metadata} ->> 'invoiceId' = ${id}`,
-        ),
-      )
-      .orderBy(desc(activityLogs.createdAt), desc(activityLogs.id))
-      .limit(60),
+  const C = await getDb();
+  const invoice = await C.invoices.findOne({ $and: [{ id }, scopeInvoices(viewer)] });
+  if (!invoice) return null;
+  const [customer, brand, sale, agent, entity] = await Promise.all([
+    C.customers.findOne({ id: invoice.customerId }),
+    C.brands.findOne({ id: invoice.brandId }),
+    C.sales.findOne({ id: invoice.saleId }),
+    C.users.findOne({ id: invoice.agentId }, { projection: { id: 1, name: 1, email: 1 } }),
+    C.legalEntities.findOne({ id: invoice.legalEntityId }),
   ]);
+  if (!customer || !brand || !sale) return null;
+  const inv = {
+    invoice,
+    customerName: customer.fullName,
+    customerCompany: customer.companyName,
+    customerEmail: customer.email,
+    agentName: agent?.name ?? null,
+    agentEmail: agent?.email ?? null,
+    entityName: entity?.registeredName ?? null,
+    entityCode: entity?.internalCode ?? null,
+    entityJurisdiction: entity?.jurisdiction ?? null,
+    brandName: brand.name,
+    allowedPaymentMethods: brand.allowedPaymentMethods,
+    saleDate: sale.saleDate,
+    saleStatus: sale.status,
+    saleNotes: sale.notes,
+  };
+
+  const [items, saleLines, ledgerRows, cases, adjustmentRows, activityRows] = await Promise.all([
+    C.invoiceItems.find({ invoiceId: id }, { sort: { id: 1 } }).toArray(),
+    C.saleItems.find({ saleId: invoice.saleId }, { sort: { id: 1 } }).toArray(),
+    C.transactions.find({ invoiceId: id }, { sort: { occurredAt: 1, id: 1 } }).toArray(),
+    can(viewer, "chargebacks.view")
+      ? C.chargebackCases
+          .find(
+            { $and: [{ invoiceId: id }, scopeCases(viewer)] },
+            { sort: { requestDate: -1 }, projection: { id: 1, caseType: 1, status: 1, amount: 1, currency: 1, reasonCode: 1, requestDate: 1 } },
+          )
+          .toArray()
+      : Promise.resolve([]),
+    C.financialAdjustments.find({ invoiceId: id }, { sort: { createdAt: -1 } }).toArray(),
+    C.activityLogs
+      .find(
+        { $or: [{ entityType: "invoice", entityId: id }, { entityType: "sale", entityId: invoice.saleId }, { "metadata.invoiceId": id }] },
+        { sort: { createdAt: -1, id: -1 }, limit: 60 },
+      )
+      .toArray(),
+  ]);
+  const names = new Map(
+    (
+      await C.users
+        .find(
+          { id: { $in: ids(uniq([...ledgerRows.map((t) => t.createdBy), ...adjustmentRows.map((a) => a.requestedBy), ...activityRows.map((a) => a.actorId)])) } },
+          { projection: { id: 1, name: 1 } },
+        )
+        .toArray()
+    ).map((u) => [u.id, u.name]),
+  );
+  const nameOf = (uid: string | null) => (uid ? (names.get(uid) ?? null) : null);
+  const ledger = ledgerRows.map((t) => ({
+    id: t.id,
+    type: t.type,
+    status: t.status,
+    amount: t.amount,
+    currency: t.currency,
+    paymentMethod: t.paymentMethod,
+    processor: t.processor,
+    paymentReference: t.paymentReference,
+    occurredAt: t.occurredAt,
+    relatedTransactionId: t.relatedTransactionId,
+    chargebackCaseId: t.chargebackCaseId,
+    adjustmentId: t.adjustmentId,
+    notes: t.notes,
+    createdByName: nameOf(t.createdBy),
+  }));
+  const adjustments = adjustmentRows.map((a) => ({
+    id: a.id,
+    type: a.type,
+    status: a.status,
+    amount: a.amount,
+    currency: a.currency,
+    reason: a.reason,
+    createdAt: a.createdAt,
+    requestedByName: nameOf(a.requestedBy),
+  }));
+  const activity = activityRows.map((a) => ({ id: a.id, action: a.action, summary: a.summary, createdAt: a.createdAt, actor: nameOf(a.actorId) }));
 
   const approvedAdj = adjustments.filter((a) => a.status === "approved").reduce((s, a) => s + toCents(a.amount), 0);
   const total = toCents(invoice.total);
@@ -239,28 +260,3 @@ export async function getInvoiceDetail(viewer: Viewer, id: string) {
 }
 
 export type InvoiceDetail = NonNullable<Awaited<ReturnType<typeof getInvoiceDetail>>>;
-
-/* ------------------------------------------------------- adjustments */
-
-export function adjustmentWhere(viewer: Viewer, f: ListFilters) {
-  const q = f.q.trim();
-  const like = `%${q.replace(/[%_]/g, "")}%`;
-  return and(
-    inArray(financialAdjustments.brandId, brandFilter(viewer, f.brand)),
-    viewer.entityIds === "all" ? undefined : inArray(financialAdjustments.legalEntityId, viewer.entityIds.length ? viewer.entityIds : ["__none__"]),
-    f.status ? eq(financialAdjustments.status, f.status as never) : undefined,
-    f.type ? eq(financialAdjustments.type, f.type as never) : undefined,
-    f.entity ? eq(financialAdjustments.legalEntityId, f.entity) : undefined,
-    q
-      ? or(
-          ilike(financialAdjustments.id, like),
-          ilike(invoices.invoiceNumber, like),
-          ilike(customers.fullName, like),
-          ilike(financialAdjustments.reason, like),
-        )
-      : undefined,
-    f.from ? sql`${financialAdjustments.createdAt} >= ${f.from}` : undefined,
-    f.to ? sql`${financialAdjustments.createdAt} <= ${f.to}` : undefined,
-  );
-}
-

@@ -1,7 +1,7 @@
 "use server";
 
 import { refresh } from "next/cache";
-import { getDb } from "@/lib/db";
+import { withTransaction } from "@/lib/db";
 import { authorize, can, canAccessBrand } from "@/lib/auth/viewer";
 import { BusinessRuleError, runAction } from "@/lib/actions";
 import type { ActionResult } from "@/lib/action-result";
@@ -88,12 +88,11 @@ export async function entityOptionsAction(input: { brandId: string; caseType: "c
   return runAction(async () => {
     const viewer = await authorize("chargebacks.create");
     if (!canAccessBrand(viewer, input.brandId)) throw new BusinessRuleError("You are not authorised for this brand.");
-    const db = await getDb();
-    const orig = await getOriginalTransaction(viewer, input.originalTransactionId, db);
+    const orig = await getOriginalTransaction(viewer, input.originalTransactionId);
     if (!orig) throw new BusinessRuleError("Original transaction not accessible.");
     const at = /^\d{4}-\d{2}-\d{2}$/.test(input.requestDate) ? new Date(`${input.requestDate}T12:00:00Z`) : new Date();
-    const options = await eligibleResponsibleEntities(db, input.brandId, input.caseType, orig.legalEntityId, at);
-    const policy = await readPolicy(db);
+    const options = await eligibleResponsibleEntities(input.brandId, input.caseType, orig.legalEntityId, at);
+    const policy = await readPolicy();
     return {
       ok: true,
       data: {
@@ -109,8 +108,7 @@ export async function entityOptionsAction(input: { brandId: string; caseType: "c
 export async function createCaseAction(input: CaseInput, submit: boolean): Promise<ActionResult<{ id: string }>> {
   return runAction(async () => {
     const viewer = await authorize("chargebacks.create");
-    const db = await getDb();
-    const id = await db.transaction((tx) => createCase(tx, viewer, input, submit));
+    const id = await withTransaction(() => createCase(viewer, input, submit));
     return { ok: true, data: { id }, message: submit ? `${id} submitted for review.` : `${id} saved as draft.` };
   });
 }
@@ -118,8 +116,7 @@ export async function createCaseAction(input: CaseInput, submit: boolean): Promi
 export async function updateDraftAction(id: string, input: CaseInput): Promise<ActionResult> {
   return runAction(async () => {
     const viewer = await authorize("chargebacks.create");
-    const db = await getDb();
-    const res = await db.transaction((tx) => updateDraft(tx, viewer, id, input));
+    const res = await withTransaction(() => updateDraft(viewer, id, input));
     refresh();
     return { ok: true, message: res.changed ? "Draft updated." : "No changes to save." };
   });
@@ -131,8 +128,7 @@ export async function transitionAction(id: string, action: WorkflowAction, note:
   return runAction(async () => {
     if (!ALLOWED.includes(action)) throw new BusinessRuleError("Unknown action.");
     const viewer = await authorize("chargebacks.view");
-    const db = await getDb();
-    const res = await db.transaction((tx) => transition(tx, viewer, id, action, String(note ?? ""), extra));
+    const res = await withTransaction(() => transition(viewer, id, action, String(note ?? ""), extra));
     refresh();
     const msg: Partial<Record<WorkflowAction, string>> = {
       submit: "Submitted for review.",
@@ -153,8 +149,7 @@ export async function transitionAction(id: string, action: WorkflowAction, note:
 export async function recordEvidenceAction(id: string, input: { externalProcessorReference?: string; evidenceSummary?: string }): Promise<ActionResult> {
   return runAction(async () => {
     const viewer = await authorize("chargebacks.view");
-    const db = await getDb();
-    await db.transaction((tx) => recordEvidence(tx, viewer, id, input));
+    await withTransaction(() => recordEvidence(viewer, id, input));
     refresh();
     return { ok: true, message: "Evidence recorded." };
   });

@@ -1,20 +1,8 @@
 import "server-only";
 import { z } from "zod";
-import { and, eq, sql } from "drizzle-orm";
-import type { DbOrTx } from "@/lib/db";
-import {
-  brandLegalEntities,
-  brands,
-  customers,
-  integrationRuns,
-  integrationSources,
-  paymentMethod,
-  productsServices,
-  tasks,
-  userBrandAccess,
-  userRoles,
-  users,
-} from "@/lib/db/schema";
+import { getDb, type TableKey } from "@/lib/db";
+import { equalsCi } from "@/lib/db/query";
+import { paymentMethod } from "@/lib/db/schema";
 import { logActivity } from "@/lib/audit";
 import { BusinessRuleError } from "@/lib/actions";
 import type { Viewer } from "@/lib/auth/viewer";
@@ -44,29 +32,32 @@ function initials(name: string) {
 }
 
 /** Short unique code (also the invoice prefix): initials or first letters, de-duplicated with a digit. */
-async function uniqueCode(tx: DbOrTx, name: string) {
+async function uniqueCode(name: string) {
   const letters = name.toUpperCase().replace(/[^A-Z0-9 ]/g, "");
   const words = letters.split(" ").filter(Boolean);
   const base = (words.length >= 3 ? words.map((w) => w[0]).join("") : words.length === 2 ? words[0].slice(0, 2) + words[1][0] : letters.replace(/ /g, "").slice(0, 3)).slice(0, 4) || "BRD";
-  const taken = new Set((await tx.select({ code: brands.code, prefix: brands.invoicePrefix }).from(brands)).flatMap((b) => [b.code, b.prefix]));
+  const C = await getDb();
+  const taken = new Set((await C.brands.find({}, { projection: { code: 1, invoicePrefix: 1 } }).toArray()).flatMap((b) => [b.code, b.invoicePrefix]));
   if (!taken.has(base)) return base;
   for (let i = 2; i < 100; i++) if (!taken.has(`${base.slice(0, 3)}${i}`)) return `${base.slice(0, 3)}${i}`;
   throw new BusinessRuleError("Could not derive a unique brand code — try a different name.");
 }
 
-async function assertNameFree(tx: DbOrTx, name: string, exceptId?: string) {
-  const [dupe] = await tx.select({ id: brands.id }).from(brands).where(eq(sql`lower(${brands.name})`, name.toLowerCase()));
+async function assertNameFree(name: string, exceptId?: string) {
+  const C = await getDb();
+  const dupe = await C.brands.findOne({ name: equalsCi(name) }, { projection: { id: 1 } });
   if (dupe && dupe.id !== exceptId) throw new BusinessRuleError("A brand with this name already exists.", { name: ["Name already in use."] });
 }
 
-export async function createBrand(tx: DbOrTx, viewer: Viewer, raw: BrandInput) {
+export async function createBrand(viewer: Viewer, raw: BrandInput) {
   const input = brandSchema.parse(raw);
-  await assertNameFree(tx, input.name);
-  const code = await uniqueCode(tx, input.name);
+  const C = await getDb();
+  await assertNameFree(input.name);
+  const code = await uniqueCode(input.name);
   const id = `BRD-${code}`;
-  const n = (await tx.select({ id: brands.id }).from(brands)).length;
+  const n = await C.brands.countDocuments();
   const now = new Date();
-  await tx.insert(brands).values({
+  await C.brands.insertOne({
     id,
     code,
     name: input.name,
@@ -86,31 +77,36 @@ export async function createBrand(tx: DbOrTx, viewer: Viewer, raw: BrandInput) {
     updatedAt: now,
   });
   // Super Admins always have every brand; agents are assigned on the Agents page.
-  const admins = await tx.select({ id: users.id }).from(users).innerJoin(userRoles, and(eq(userRoles.userId, users.id), eq(userRoles.roleId, "super_admin")));
-  if (admins.length) await tx.insert(userBrandAccess).values(admins.map((a) => ({ userId: a.id, brandId: id, grantedBy: viewer.id }))).onConflictDoNothing();
-  await logActivity(tx, { actorId: viewer.id, action: "brand.created", entityType: "brand", entityId: id, brandId: id, summary: `Brand ${input.name} created (${id})`, metadata: { logo: !!input.logo } });
+  const admins = await C.userRoles.distinct("userId", { roleId: "super_admin" });
+  for (const userId of admins) {
+    await C.userBrandAccess.updateOne({ userId, brandId: id }, { $setOnInsert: { userId, brandId: id, grantedBy: viewer.id, grantedAt: now } }, { upsert: true });
+  }
+  await logActivity({ actorId: viewer.id, action: "brand.created", entityType: "brand", entityId: id, brandId: id, summary: `Brand ${input.name} created (${id})`, metadata: { logo: !!input.logo } });
   return { id };
 }
 
-export async function updateBrand(tx: DbOrTx, viewer: Viewer, id: string, raw: BrandInput) {
+export async function updateBrand(viewer: Viewer, id: string, raw: BrandInput) {
   const input = brandSchema.parse(raw);
-  const [existing] = await tx.select().from(brands).where(eq(brands.id, id));
+  const C = await getDb();
+  const existing = await C.brands.findOne({ id });
   if (!existing) throw new BusinessRuleError("Brand not found.");
-  await assertNameFree(tx, input.name, id);
+  await assertNameFree(input.name, id);
   const changes: string[] = [];
   if (input.name !== existing.name) changes.push("name");
   if (input.logo !== undefined && input.logo !== existing.logoUrl) changes.push(input.logo ? "logo" : "logo removed");
   if (!changes.length) return { changed: false };
-  await tx
-    .update(brands)
-    .set({
+  await C.brands.updateOne(
+    { id },
+    {
+      $set: {
       name: input.name,
       logoText: input.name !== existing.name ? initials(input.name) : existing.logoText,
       logoUrl: input.logo === undefined ? existing.logoUrl : input.logo,
       updatedAt: new Date(),
-    })
-    .where(eq(brands.id, id));
-  await logActivity(tx, {
+      },
+    },
+  );
+  await logActivity({
     actorId: viewer.id,
     action: "brand.updated",
     entityType: "brand",
@@ -128,24 +124,24 @@ export async function updateBrand(tx: DbOrTx, viewer: Viewer, id: string, raw: B
  * never erased. Configuration rows (agent access, products, integration
  * placeholder) are removed with the brand.
  */
-export async function deleteBrand(tx: DbOrTx, viewer: Viewer, id: string) {
-  const [brand] = await tx.select().from(brands).where(eq(brands.id, id));
+export async function deleteBrand(viewer: Viewer, id: string) {
+  const C = await getDb();
+  const brand = await C.brands.findOne({ id });
   if (!brand) throw new BusinessRuleError("Brand not found.");
-  // Tables holding business history for a brand (all have a brand_id column).
-  const HISTORY: [string, string][] = [
-    ["customers", "customer_brand_relationships"],
+  // Collections holding business history for a brand (all have a brandId field).
+  const HISTORY: [string, TableKey][] = [
+    ["customers", "customerBrandRelationships"],
     ["sales", "sales"],
     ["invoices", "invoices"],
     ["payments", "transactions"],
-    ["chargebacks", "chargeback_cases"],
+    ["chargebacks", "chargebackCases"],
     ["leads", "leads"],
-    ["adjustments", "financial_adjustments"],
-    ["reconciliation records", "reconciliation_records"],
+    ["adjustments", "financialAdjustments"],
+    ["reconciliation records", "reconciliationRecords"],
   ];
   const blocking: [string, number][] = [];
-  for (const [label, table] of HISTORY) {
-    const res = await tx.execute<{ n: number }>(sql`select count(*)::int as n from ${sql.identifier(table)} where brand_id = ${id}`);
-    const n = Number(res.rows[0]?.n ?? 0);
+  for (const [label, key] of HISTORY) {
+    const n = await (C[key] as unknown as { countDocuments(f: object): Promise<number> }).countDocuments({ brandId: id });
     if (n > 0) blocking.push([label, n]);
   }
   if (blocking.length) {
@@ -153,15 +149,15 @@ export async function deleteBrand(tx: DbOrTx, viewer: Viewer, id: string) {
       `${brand.name} can't be deleted: it has ${blocking.map(([k, n]) => `${n} ${k}`).join(", ")}. Financial history is never erased.`,
     );
   }
-  await tx.update(customers).set({ firstBrandId: null }).where(eq(customers.firstBrandId, id));
-  await tx.delete(tasks).where(eq(tasks.brandId, id));
-  await tx.delete(productsServices).where(eq(productsServices.brandId, id));
-  await tx.delete(brandLegalEntities).where(eq(brandLegalEntities.brandId, id));
-  await tx.delete(userBrandAccess).where(eq(userBrandAccess.brandId, id));
-  const sources = await tx.select({ id: integrationSources.id }).from(integrationSources).where(eq(integrationSources.brandId, id));
-  for (const s of sources) await tx.delete(integrationRuns).where(eq(integrationRuns.sourceId, s.id));
-  await tx.delete(integrationSources).where(eq(integrationSources.brandId, id));
-  await tx.delete(brands).where(eq(brands.id, id));
-  await logActivity(tx, { actorId: viewer.id, action: "brand.deleted", entityType: "brand", entityId: id, summary: `Brand ${brand.name} (${id}) deleted` });
+  await C.customers.updateMany({ firstBrandId: id }, { $set: { firstBrandId: null } });
+  await C.tasks.deleteMany({ brandId: id });
+  await C.productsServices.deleteMany({ brandId: id });
+  await C.brandLegalEntities.deleteMany({ brandId: id });
+  await C.userBrandAccess.deleteMany({ brandId: id });
+  const sources = await C.integrationSources.distinct("id", { brandId: id });
+  await C.integrationRuns.deleteMany({ sourceId: { $in: sources } });
+  await C.integrationSources.deleteMany({ brandId: id });
+  await C.brands.deleteOne({ id });
+  await logActivity({ actorId: viewer.id, action: "brand.deleted", entityType: "brand", entityId: id, summary: `Brand ${brand.name} (${id}) deleted` });
   return { name: brand.name };
 }

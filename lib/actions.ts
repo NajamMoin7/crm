@@ -1,6 +1,7 @@
 import "server-only";
 import { ZodError } from "zod";
 import { AuthorizationError } from "@/lib/auth/viewer";
+import { ImmutableRecordError } from "@/lib/db";
 import type { ActionResult } from "@/lib/action-result";
 
 export class BusinessRuleError extends Error {
@@ -34,6 +35,9 @@ export async function runAction<T>(fn: () => Promise<ActionResult<T>>): Promise<
     if (isNextControlFlow(err)) throw err; // redirect() / notFound()
     if (err instanceof AuthorizationError) return { ok: false, error: err.message };
     if (err instanceof BusinessRuleError) return { ok: false, error: err.message, fieldErrors: err.fieldErrors };
+    if (err instanceof ImmutableRecordError) return { ok: false, error: err.message };
+    // MongoDB unique index violation (e.g. a payment reference used twice).
+    if ((err as { code?: number })?.code === 11000) return { ok: false, error: "That record already exists — a unique value (such as a reference or number) is already in use." };
     if (err instanceof ZodError) {
       const fieldErrors: Record<string, string[]> = {};
       for (const issue of err.issues) {

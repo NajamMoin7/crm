@@ -1,6 +1,5 @@
 import { Suspense } from "react";
 import Link from "next/link";
-import { and, count, desc, eq, isNull } from "drizzle-orm";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SidebarNav } from "@/components/shell/sidebar-nav";
@@ -18,7 +17,6 @@ import { getActiveBrand } from "@/lib/auth/scope";
 import { allowedHrefs } from "@/lib/nav";
 import { getViewerBrands } from "@/lib/data/reference";
 import { getDb } from "@/lib/db";
-import { notifications } from "@/lib/db/schema";
 import { fmtRelative, initials } from "@/lib/format";
 
 /**
@@ -68,12 +66,12 @@ async function SidebarSlot() {
 
 async function TopbarSlot() {
   const viewer = await requireViewer();
-  const db = await getDb();
-  const [brandList, active, recent, [{ unread }]] = await Promise.all([
+  const C = await getDb();
+  const [brandList, active, recent, unread] = await Promise.all([
     getViewerBrands(viewer),
     getActiveBrand(viewer),
-    db.select().from(notifications).where(eq(notifications.userId, viewer.id)).orderBy(desc(notifications.createdAt)).limit(8),
-    db.select({ unread: count() }).from(notifications).where(and(eq(notifications.userId, viewer.id), isNull(notifications.readAt))),
+    C.notifications.find({ userId: viewer.id }, { sort: { createdAt: -1 }, limit: 8 }).toArray(),
+    C.notifications.countDocuments({ userId: viewer.id, readAt: null }),
   ]);
   const now = new Date();
   return (

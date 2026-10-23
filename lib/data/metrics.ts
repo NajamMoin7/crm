@@ -1,15 +1,8 @@
 import "server-only";
-import { and, count, countDistinct, eq, exists, gte, inArray, lte, ne, or, sql, sum, type SQL, notInArray } from "drizzle-orm";
-import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import type { Document, Filter } from "mongodb";
 import { format as fmtD, subMonths } from "date-fns";
-import { getDb } from "@/lib/db";
-import {
-  chargebackCases,
-  customers,
-  financialAdjustments,
-  invoices,
-  sales,
-  transactions } from "@/lib/db/schema";
+import { getDb, type RowOf } from "@/lib/db";
+import { decStr, ids, sumDec } from "@/lib/db/query";
 import { brandFilter, resolveBrand, scopeCases, scopeCustomers, scopeInvoices, scopeSales, scopeTransactions } from "@/lib/auth/scope";
 import { can, canAccessEntity, type Viewer } from "@/lib/auth/viewer";
 import { parseFilters, type ListFilters, type RawSearchParams } from "@/lib/filters";
@@ -18,9 +11,9 @@ import { CASE_OPEN_STATUSES } from "@/lib/domain/vocab";
 import { getAgents } from "@/lib/data/reference";
 
 /**
- * Executive metrics. Every number is computed in SQL from the underlying
- * records and composed with the row-level scope helpers, so a user only ever
- * aggregates data they are allowed to see.
+ * Executive metrics. Every number is computed in the database from the
+ * underlying records and composed with the record-level scope filters, so a
+ * user only ever aggregates data they are allowed to see.
  *
  * Definitions (kept in one place so the dashboard, brand page and reports agree):
  * - Gross sales     = Σ sales.total of non-cancelled sales, by sale date.
@@ -60,83 +53,124 @@ export function isInvoiceStatus(s: string | null): s is (typeof INVOICE_STATUSES
   return !!s && (INVOICE_STATUSES as readonly string[]).includes(s);
 }
 
-export function inRange(col: AnyPgColumn, f: Pick<MetricFilters, "from" | "to">): SQL | undefined {
-  return and(f.from ? gte(col, f.from) : undefined, f.to ? lte(col, f.to) : undefined);
+/** `{ field: { $gte: from, $lte: to } }`, or `{}` for an open range. */
+export function inRange(field: string, f: Pick<MetricFilters, "from" | "to">): Document {
+  if (!f.from && !f.to) return {};
+  return { [field]: { ...(f.from ? { $gte: f.from } : {}), ...(f.to ? { $lte: f.to } : {}) } };
 }
 
-const invoiceHasStatus = (idCol: AnyPgColumn, status: string) =>
-  exists(sql`(select 1 from ${invoices} where ${invoices.id} = ${idCol} and ${invoices.status} = ${status})`);
-const invoiceHasAgent = (idCol: AnyPgColumn, agent: string) =>
-  exists(sql`(select 1 from ${invoices} where ${invoices.id} = ${idCol} and ${invoices.agentId} = ${agent})`);
+/** `$and` of the non-empty conditions. */
+export function all<T>(...conds: (Filter<T> | Document | undefined | null | false)[]): Filter<T> {
+  const list = conds.filter((c): c is Document => !!c && Object.keys(c).length > 0);
+  return (list.length ? { $and: list } : {}) as Filter<T>;
+}
+
+async function invoiceIdsWhere(filter: Filter<RowOf<"invoices">>) {
+  const C = await getDb();
+  return ids(await C.invoices.distinct("id", filter));
+}
 
 /* ------------------------------------------------------- condition builders */
 
-export function saleConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean; status?: boolean } = {}) {
-  return and(
+export async function saleConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean; status?: boolean } = {}): Promise<Filter<RowOf<"sales">>> {
+  const C = await getDb();
+  return all<RowOf<"sales">>(
     scopeSales(viewer, f.brand),
-    ne(sales.status, "cancelled"),
-    f.agent ? eq(sales.agentId, f.agent) : undefined,
-    f.entity ? eq(sales.legalEntityId, f.entity) : undefined,
-    f.customer ? eq(sales.customerId, f.customer) : undefined,
-    opts.status !== false && isInvoiceStatus(f.status)
-      ? exists(sql`(select 1 from ${invoices} where ${invoices.saleId} = ${sales.id} and ${invoices.status} = ${f.status})`)
-      : undefined,
-    opts.range === false ? undefined : inRange(sales.saleDate, f),
-  )!;
+    { status: { $ne: "cancelled" } },
+    f.agent ? { agentId: f.agent } : undefined,
+    f.entity ? { legalEntityId: f.entity } : undefined,
+    f.customer ? { customerId: f.customer } : undefined,
+    opts.status !== false && isInvoiceStatus(f.status) ? { id: { $in: ids(await C.invoices.distinct("saleId", { status: f.status })) } } : undefined,
+    opts.range === false ? undefined : inRange("saleDate", f),
+  );
 }
 
-export function invoiceConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean; status?: boolean } = {}) {
-  return and(
+export function invoiceConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean; status?: boolean } = {}): Filter<RowOf<"invoices">> {
+  return all<RowOf<"invoices">>(
     scopeInvoices(viewer, f.brand),
-    f.agent ? eq(invoices.agentId, f.agent) : undefined,
-    f.entity ? eq(invoices.legalEntityId, f.entity) : undefined,
-    f.customer ? eq(invoices.customerId, f.customer) : undefined,
-    opts.status !== false && isInvoiceStatus(f.status) ? eq(invoices.status, f.status) : undefined,
-    opts.range === false ? undefined : inRange(invoices.billingDate, f),
-  )!;
+    f.agent ? { agentId: f.agent } : undefined,
+    f.entity ? { legalEntityId: f.entity } : undefined,
+    f.customer ? { customerId: f.customer } : undefined,
+    opts.status !== false && isInvoiceStatus(f.status) ? { status: f.status } : undefined,
+    opts.range === false ? undefined : inRange("billingDate", f),
+  );
 }
 
 /** Ledger rows. Agent / invoice-status filters (and own-only billing scope) apply through the linked invoice. */
-export function txnConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean } = {}) {
-  return and(
+export async function txnConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean } = {}): Promise<Filter<RowOf<"transactions">>> {
+  return all<RowOf<"transactions">>(
     scopeTransactions(viewer, f.brand),
-    f.entity ? eq(transactions.legalEntityId, f.entity) : undefined,
-    f.customer ? eq(transactions.customerId, f.customer) : undefined,
-    f.agent ? invoiceHasAgent(transactions.invoiceId, f.agent) : undefined,
-    !can(viewer, "billing.view_all") ? invoiceHasAgent(transactions.invoiceId, viewer.id) : undefined,
-    isInvoiceStatus(f.status) ? invoiceHasStatus(transactions.invoiceId, f.status) : undefined,
-    opts.range === false ? undefined : inRange(transactions.occurredAt, f),
-  )!;
+    f.entity ? { legalEntityId: f.entity } : undefined,
+    f.customer ? { customerId: f.customer } : undefined,
+    f.agent ? { invoiceId: { $in: await invoiceIdsWhere({ agentId: f.agent }) } } : undefined,
+    !can(viewer, "billing.view_all") ? { invoiceId: { $in: await invoiceIdsWhere({ agentId: viewer.id }) } } : undefined,
+    isInvoiceStatus(f.status) ? { invoiceId: { $in: await invoiceIdsWhere({ status: f.status }) } } : undefined,
+    opts.range === false ? undefined : inRange("occurredAt", f),
+  );
 }
 
 /** Customer chargeback cases only (intercompany recharges are a separate type and never counted here). */
-export function caseConds(viewer: Viewer, f: MetricFilters, opts: { range?: boolean; type?: "chargeback" | "intercompany_recharge" | "any" } = {}) {
+export async function caseConds(
+  viewer: Viewer,
+  f: MetricFilters,
+  opts: { range?: boolean; type?: "chargeback" | "intercompany_recharge" | "any" } = {},
+): Promise<Filter<RowOf<"chargebackCases">>> {
   const type = opts.type ?? "chargeback";
-  return and(
+  return all<RowOf<"chargebackCases">>(
     scopeCases(viewer, f.brand),
-    type === "any" ? undefined : eq(chargebackCases.caseType, type),
-    f.entity ? or(eq(chargebackCases.originalLegalEntityId, f.entity), eq(chargebackCases.responsibleLegalEntityId, f.entity)) : undefined,
-    f.customer ? eq(chargebackCases.customerId, f.customer) : undefined,
-    f.agent ? invoiceHasAgent(chargebackCases.invoiceId, f.agent) : undefined,
-    isInvoiceStatus(f.status) ? invoiceHasStatus(chargebackCases.invoiceId, f.status) : undefined,
-    opts.range === false ? undefined : inRange(chargebackCases.requestDate, f),
-  )!;
+    type === "any" ? undefined : { caseType: type },
+    f.entity ? { $or: [{ originalLegalEntityId: f.entity }, { responsibleLegalEntityId: f.entity }] } : undefined,
+    f.customer ? { customerId: f.customer } : undefined,
+    f.agent ? { invoiceId: { $in: await invoiceIdsWhere({ agentId: f.agent }) } } : undefined,
+    isInvoiceStatus(f.status) ? { invoiceId: { $in: await invoiceIdsWhere({ status: f.status }) } } : undefined,
+    opts.range === false ? undefined : inRange("requestDate", f),
+  );
 }
 
-export function customerConds(viewer: Viewer, f: MetricFilters) {
-  return and(
-    scopeCustomers(viewer, f.brand),
-    f.agent ? eq(customers.assignedAgentId, f.agent) : undefined,
-    f.customer ? eq(customers.id, f.customer) : undefined,
-    f.entity ? exists(sql`(select 1 from ${sales} where ${sales.customerId} = ${customers.id} and ${sales.legalEntityId} = ${f.entity})`) : undefined,
-  )!;
+export async function customerConds(viewer: Viewer, f: MetricFilters): Promise<Filter<RowOf<"customers">>> {
+  const C = await getDb();
+  return all<RowOf<"customers">>(
+    await scopeCustomers(viewer, f.brand),
+    f.agent ? { assignedAgentId: f.agent } : undefined,
+    f.customer ? { id: f.customer } : undefined,
+    f.entity ? { id: { $in: ids(await C.sales.distinct("customerId", { legalEntityId: f.entity })) } } : undefined,
+  );
 }
 
-/** Sum of approved adjustments for the current invoice row (correlated subquery). */
-const approvedAdjustments = sql`coalesce((select sum(${financialAdjustments.amount}) from ${financialAdjustments} where ${financialAdjustments.invoiceId} = ${invoices.id} and ${financialAdjustments.status} = 'approved'), 0)`;
-export const invoiceBalance = sql<string>`greatest(${invoices.total} - ${invoices.amountPaid} - ${approvedAdjustments}, 0)`;
+/**
+ * Pipeline stages adding `balance` (Decimal128) to invoice documents:
+ * greatest(total − amount paid − approved adjustments, 0).
+ */
+export function invoiceBalanceStages(): Document[] {
+  return [
+    {
+      $lookup: {
+        from: "financial_adjustments",
+        let: { inv: "$id" },
+        pipeline: [
+          { $match: { $expr: { $and: [{ $eq: ["$invoiceId", "$$inv"] }, { $eq: ["$status", "approved"] }] } } },
+          { $group: { _id: null, v: sumDec("$amount") } },
+        ],
+        as: "_adj",
+      },
+    },
+    {
+      $addFields: {
+        adjusted: { $ifNull: [{ $first: "$_adj.v" }, { $toDecimal: "0" }] },
+      },
+    },
+    {
+      $addFields: {
+        balance: {
+          $max: [{ $subtract: [{ $subtract: [{ $toDecimal: "$total" }, { $toDecimal: "$amountPaid" }] }, "$adjusted"] }, { $toDecimal: "0" }],
+        },
+      },
+    },
+    { $project: { _adj: 0 } },
+  ];
+}
 
-const c = (v: string | number | null | undefined) => toCents(v ?? 0);
+const c = (v: unknown) => toCents(decStr(v));
 
 /* -------------------------------------------------------------------- KPIs */
 
@@ -163,68 +197,79 @@ export type Kpis = {
   totalAgents: number;
 };
 
+type Agg = { _id: unknown; n: number; v?: unknown };
+const first = <T>(rows: T[]) => rows[0];
+
 export async function getKpis(viewer: Viewer, f: MetricFilters): Promise<Kpis> {
-  const db = await getDb();
-  const cust = customerConds(viewer, f);
-  const [[tc], [nc], [s], [p], [o], pend, [cb], [ag], agents, [bl]] = await Promise.all([
-    db.select({ n: count() }).from(customers).where(cust),
-    db.select({ n: count() }).from(customers).where(and(cust, inRange(customers.createdAt, f))),
-    db.select({ n: count(), gross: sum(sales.total) }).from(sales).where(saleConds(viewer, f)),
-    db
-      .select({ n: count(), amt: sum(transactions.amount) })
-      .from(transactions)
-      .where(and(txnConds(viewer, f), eq(transactions.type, "payment"), eq(transactions.status, "succeeded"))),
-    db
-      .select({ n: count(), amt: sql<string>`sum(${invoiceBalance})` })
-      .from(invoices)
-      .where(and(invoiceConds(viewer, f), inArray(invoices.status, [...OPEN_INVOICE_STATUSES]))),
-    db
-      .select({ status: invoices.status, n: count() })
-      .from(invoices)
-      .where(and(invoiceConds(viewer, f), inArray(invoices.status, ["draft", "pending"])))
-      .groupBy(invoices.status),
-    db
-      .select({
-        n: count(),
-        open: sql<number>`count(*) filter (where ${inArray(chargebackCases.status, [...CASE_OPEN_STATUSES])})`.mapWith(Number),
-        completed: sql<number>`count(*) filter (where ${chargebackCases.status} = 'completed')`.mapWith(Number),
-        completedAmt: sql<string>`coalesce(sum(${chargebackCases.amount}) filter (where ${chargebackCases.status} = 'completed'), 0)`,
-        openAmt: sql<string>`coalesce(sum(${chargebackCases.amount}) filter (where ${inArray(chargebackCases.status, [...CASE_OPEN_STATUSES])}), 0)`,
-      })
-      .from(chargebackCases)
-      .where(caseConds(viewer, f)),
-    db.select({ n: countDistinct(sales.agentId) }).from(sales).where(saleConds(viewer, f)),
+  const C = await getDb();
+  const [cust, sc, tc0, cc] = await Promise.all([customerConds(viewer, f), saleConds(viewer, f), txnConds(viewer, f), caseConds(viewer, f)]);
+  const ic = invoiceConds(viewer, f);
+  const open = [...CASE_OPEN_STATUSES] as string[];
+  const [tc, nc, s, p, o, pend, cb, agentIds, agents, bl] = await Promise.all([
+    C.customers.countDocuments(cust),
+    C.customers.countDocuments(all(cust, inRange("createdAt", f))),
+    C.sales.aggregate<Agg>([{ $match: sc }, { $group: { _id: null, n: { $sum: 1 }, v: sumDec("$total") } }]).toArray().then(first),
+    C.transactions
+      .aggregate<Agg>([{ $match: all(tc0, { type: "payment", status: "succeeded" }) }, { $group: { _id: null, n: { $sum: 1 }, v: sumDec("$amount") } }])
+      .toArray()
+      .then(first),
+    C.invoices
+      .aggregate<Agg>([
+        { $match: all(ic, { status: { $in: [...OPEN_INVOICE_STATUSES] } }) },
+        ...invoiceBalanceStages(),
+        { $group: { _id: null, n: { $sum: 1 }, v: { $sum: "$balance" } } },
+      ])
+      .toArray()
+      .then(first),
+    C.invoices.aggregate<Agg>([{ $match: all(ic, { status: { $in: ["draft", "pending"] } }) }, { $group: { _id: "$status", n: { $sum: 1 } } }]).toArray(),
+    C.chargebackCases
+      .aggregate<{ n: number; open: number; completed: number; completedAmt: unknown; openAmt: unknown }>([
+        { $match: cc },
+        {
+          $group: {
+            _id: null,
+            n: { $sum: 1 },
+            open: { $sum: { $cond: [{ $in: ["$status", open] }, 1, 0] } },
+            completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } },
+            completedAmt: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, { $toDecimal: "$amount" }, { $toDecimal: "0" }] } },
+            openAmt: { $sum: { $cond: [{ $in: ["$status", open] }, { $toDecimal: "$amount" }, { $toDecimal: "0" }] } },
+          },
+        },
+      ])
+      .toArray()
+      .then(first),
+    C.sales.distinct("agentId", sc),
     getAgents(),
     // Billed = issued invoices (not draft, not cancelled) billed in range.
-    db
-      .select({ n: count(), amt: sum(invoices.total) })
-      .from(invoices)
-      .where(and(invoiceConds(viewer, f), notInArray(invoices.status, ["draft", "cancelled"]))),
+    C.invoices
+      .aggregate<Agg>([{ $match: all(ic, { status: { $nin: ["draft", "cancelled"] } }) }, { $group: { _id: null, n: { $sum: 1 }, v: sumDec("$total") } }])
+      .toArray()
+      .then(first),
   ]);
   const brands = brandFilter(viewer, f.brand);
   const pool = agents.filter((a) => a.status === "active" && a.brandIds.some((b) => brands.includes(b)) && (!f.agent || a.id === f.agent));
-  const pd = pend.find((r) => r.status === "draft")?.n ?? 0;
-  const pp = pend.find((r) => r.status === "pending")?.n ?? 0;
+  const pd = pend.find((r) => r._id === "draft")?.n ?? 0;
+  const pp = pend.find((r) => r._id === "pending")?.n ?? 0;
   return {
-    totalCustomers: tc.n,
-    newCustomers: nc.n,
-    salesCount: s.n,
-    grossCents: c(s.gross),
-    collectedCents: c(p.amt),
-    paymentsCount: p.n,
-    outstandingCents: c(o.amt),
-    outstandingCount: o.n,
+    totalCustomers: tc,
+    newCustomers: nc,
+    salesCount: s?.n ?? 0,
+    grossCents: c(s?.v),
+    collectedCents: c(p?.v),
+    paymentsCount: p?.n ?? 0,
+    outstandingCents: c(o?.v),
+    outstandingCount: o?.n ?? 0,
     pendingBilling: pd + pp,
-    billedCents: c(bl.amt),
-    invoiceCount: bl.n,
+    billedCents: c(bl?.v),
+    invoiceCount: bl?.n ?? 0,
     pendingDraft: pd,
     pendingPending: pp,
-    cbCases: cb.n,
-    cbOpen: cb.open,
-    cbCompleted: cb.completed,
-    cbCompletedCents: c(cb.completedAmt),
-    cbOpenCents: c(cb.openAmt),
-    activeAgents: ag.n,
+    cbCases: cb?.n ?? 0,
+    cbOpen: cb?.open ?? 0,
+    cbCompleted: cb?.completed ?? 0,
+    cbCompletedCents: c(cb?.completedAmt),
+    cbOpenCents: c(cb?.openAmt),
+    activeAgents: agentIds.length,
     totalAgents: pool.length,
   };
 }
@@ -239,7 +284,20 @@ export function pickUnit(from: Date, to: Date): Unit {
   return days <= 35 ? "day" : days <= 190 ? "week" : "month";
 }
 
-const bucketExpr = (unit: Unit, col: AnyPgColumn) => sql<string>`to_char(date_trunc(${sql.raw(`'${unit}'`)}, ${col}), 'YYYY-MM-DD')`;
+/** Bucket key (YYYY-MM-DD of the UTC period start; weeks start on Monday) — matches `bucketExpr`. */
+function truncUtc(d: Date, unit: Unit) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), unit === "month" ? 1 : d.getUTCDate()));
+  if (unit === "week") t.setUTCDate(t.getUTCDate() - ((t.getUTCDay() + 6) % 7));
+  return t;
+}
+
+const bucketExpr = (unit: Unit, field: string) => ({
+  $dateToString: {
+    format: "%Y-%m-%d",
+    date: { $dateTrunc: { date: `$${field}`, unit, timezone: "UTC", ...(unit === "week" ? { startOfWeek: "monday" } : {}) } },
+    timezone: "UTC",
+  },
+});
 
 function labelFor(key: string, unit: Unit) {
   const [y, m, d] = key.split("-").map(Number);
@@ -247,22 +305,26 @@ function labelFor(key: string, unit: Unit) {
   return unit === "month" ? fmtD(date, "MMM yy") : fmtD(date, "MMM d");
 }
 
-/** Buckets generated in the database so they match `date_trunc` exactly (same session time zone). */
-async function makeBuckets(unit: Unit, from: Date, to: Date): Promise<Bucket[]> {
-  const db = await getDb();
-  const res = await db.execute<{ key: string }>(
-    sql`select to_char(b, 'YYYY-MM-DD') as key from generate_series(date_trunc(${sql.raw(`'${unit}'`)}, ${from.toISOString()}::timestamptz), ${to.toISOString()}::timestamptz, ${sql.raw(`'1 ${unit}'`)}::interval) as b`,
-  );
-  return (res.rows as { key: string }[]).map((r) => ({ key: r.key, label: labelFor(r.key, unit) }));
+function makeBuckets(unit: Unit, from: Date, to: Date): Bucket[] {
+  const out: Bucket[] = [];
+  for (let b = truncUtc(from, unit); b <= to && out.length < 1000; ) {
+    const key = b.toISOString().slice(0, 10);
+    out.push({ key, label: labelFor(key, unit) });
+    b = new Date(b);
+    if (unit === "day") b.setUTCDate(b.getUTCDate() + 1);
+    else if (unit === "week") b.setUTCDate(b.getUTCDate() + 7);
+    else b.setUTCMonth(b.getUTCMonth() + 1);
+  }
+  return out;
 }
 
 /** Effective window for trend charts: for "All time" start at the earliest scoped sale. */
 async function trendWindow(viewer: Viewer, f: MetricFilters, now: Date) {
   let from = f.from;
   if (!from) {
-    const db = await getDb();
-    const [r] = await db.select({ min: sql<string | null>`min(${sales.saleDate})` }).from(sales).where(saleConds(viewer, f, { range: false }));
-    from = r?.min ? new Date(r.min) : subMonths(now, 12);
+    const C = await getDb();
+    const firstSale = await C.sales.findOne(await saleConds(viewer, f, { range: false }), { sort: { saleDate: 1 }, projection: { saleDate: 1 } });
+    from = firstSale?.saleDate ? new Date(firstSale.saleDate) : subMonths(now, 12);
   }
   const to = f.to ?? now;
   return { from, to, unit: pickUnit(from, to) };
@@ -281,47 +343,47 @@ function pivot(buckets: Bucket[], data: { bucket: string; brandId: string; v: nu
 
 /** Gross sales per brand over time (dollars). */
 export async function salesTrend(viewer: Viewer, f: MetricFilters, now: Date): Promise<TrendResult> {
-  const db = await getDb();
+  const C = await getDb();
   const { from, to, unit } = await trendWindow(viewer, f, now);
-  const b = bucketExpr(unit, sales.saleDate);
-  const [buckets, data] = await Promise.all([
-    makeBuckets(unit, from, to),
-    db.select({ bucket: b, brandId: sales.brandId, v: sum(sales.total) }).from(sales).where(and(saleConds(viewer, f, { range: false }), inRange(sales.saleDate, { from, to }))).groupBy(b, sales.brandId),
-  ]);
+  const buckets = makeBuckets(unit, from, to);
+  const data = await C.sales
+    .aggregate<{ _id: { bucket: string; brandId: string }; v: unknown }>([
+      { $match: all(await saleConds(viewer, f, { range: false }), inRange("saleDate", { from, to })) },
+      { $group: { _id: { bucket: bucketExpr(unit, "saleDate"), brandId: "$brandId" }, v: sumDec("$total") } },
+    ])
+    .toArray();
   const brandIds = brandFilter(viewer, f.brand).filter((x) => x !== "__none__");
-  return { unit, buckets, brandIds, rows: pivot(buckets, data.map((d) => ({ bucket: d.bucket, brandId: d.brandId, v: c(d.v) / 100 })), brandIds) };
+  return { unit, buckets, brandIds, rows: pivot(buckets, data.map((d) => ({ bucket: d._id.bucket, brandId: d._id.brandId, v: c(d.v) / 100 })), brandIds) };
 }
 
 /* ---------------------------------------------------------- breakdowns */
 
 export async function revenueByBrand(viewer: Viewer, f: MetricFilters) {
-  const db = await getDb();
+  const C = await getDb();
+  const [sc, tc] = await Promise.all([saleConds(viewer, f), txnConds(viewer, f)]);
   const [gross, coll, out] = await Promise.all([
-    db.select({ brandId: sales.brandId, v: sum(sales.total), n: count() }).from(sales).where(saleConds(viewer, f)).groupBy(sales.brandId),
-    db
-      .select({ brandId: transactions.brandId, v: sum(transactions.amount) })
-      .from(transactions)
-      .where(and(txnConds(viewer, f), eq(transactions.type, "payment"), eq(transactions.status, "succeeded")))
-      .groupBy(transactions.brandId),
-    db
-      .select({ brandId: invoices.brandId, v: sql<string>`sum(${invoiceBalance})` })
-      .from(invoices)
-      .where(and(invoiceConds(viewer, f), inArray(invoices.status, [...OPEN_INVOICE_STATUSES])))
-      .groupBy(invoices.brandId),
+    C.sales.aggregate<Agg>([{ $match: sc }, { $group: { _id: "$brandId", v: sumDec("$total"), n: { $sum: 1 } } }]).toArray(),
+    C.transactions
+      .aggregate<Agg>([{ $match: all(tc, { type: "payment", status: "succeeded" }) }, { $group: { _id: "$brandId", v: sumDec("$amount"), n: { $sum: 1 } } }])
+      .toArray(),
+    C.invoices
+      .aggregate<Agg>([
+        { $match: all(invoiceConds(viewer, f), { status: { $in: [...OPEN_INVOICE_STATUSES] } }) },
+        ...invoiceBalanceStages(),
+        { $group: { _id: "$brandId", v: { $sum: "$balance" }, n: { $sum: 1 } } },
+      ])
+      .toArray(),
   ]);
   return brandFilter(viewer, f.brand)
     .filter((x) => x !== "__none__")
     .map((brandId) => ({
       brandId,
-      grossCents: c(gross.find((g) => g.brandId === brandId)?.v),
-      salesCount: gross.find((g) => g.brandId === brandId)?.n ?? 0,
-      collectedCents: c(coll.find((g) => g.brandId === brandId)?.v),
-      outstandingCents: c(out.find((g) => g.brandId === brandId)?.v),
+      grossCents: c(gross.find((g) => g._id === brandId)?.v),
+      salesCount: gross.find((g) => g._id === brandId)?.n ?? 0,
+      collectedCents: c(coll.find((g) => g._id === brandId)?.v),
+      outstandingCents: c(out.find((g) => g._id === brandId)?.v),
     }));
 }
-
-
-/* ------------------------------------------------------- brand performance */
 
 /* ------------------------------------------------------------ link helpers */
 

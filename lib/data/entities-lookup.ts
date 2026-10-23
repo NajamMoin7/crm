@@ -1,7 +1,5 @@
 import "server-only";
-import { and, asc, eq, gte, inArray, isNull, lte, or } from "drizzle-orm";
-import { getDb, type DbOrTx } from "@/lib/db";
-import { brandLegalEntities, legalEntities } from "@/lib/db/schema";
+import { getDb } from "@/lib/db";
 
 export type EntityScope = "sale" | "chargeback";
 
@@ -34,36 +32,24 @@ const isoDay = (d: Date) => d.toISOString().slice(0, 10);
  *   ledger type for that scope (payment for sales, chargeback for chargebacks).
  * - Sorted default first, then by id. Exactly one result has `isDefault`
  *   (the flagged default, otherwise the first) — empty list when unmapped.
- *
- * Pass `db` when calling inside a transaction (PGlite has one connection).
+ * Joins the current transaction automatically when called inside one.
  */
-export async function getPermittedEntities(brandId: string, scope: EntityScope, at: Date, db?: DbOrTx): Promise<PermittedEntity[]> {
-  const conn = db ?? (await getDb());
+export async function getPermittedEntities(brandId: string, scope: EntityScope, at: Date): Promise<PermittedEntity[]> {
+  const C = await getDb();
   const day = isoDay(at);
-  const rows = await conn
-    .select({
-      mappingId: brandLegalEntities.id,
-      scope: brandLegalEntities.scope,
-      isDefault: brandLegalEntities.isDefault,
-      id: legalEntities.id,
-      registeredName: legalEntities.registeredName,
-      internalCode: legalEntities.internalCode,
-      jurisdiction: legalEntities.jurisdiction,
-      baseCurrency: legalEntities.baseCurrency,
-      permittedTypes: legalEntities.permittedTransactionTypes,
+  const maps = await C.brandLegalEntities
+    .find({ brandId, scope: { $in: [scope, "all"] }, effectiveFrom: { $lte: day }, $or: [{ effectiveTo: null }, { effectiveTo: { $gte: day } }] })
+    .toArray();
+  // Sequential (not Promise.all): this may run inside a transaction.
+  const entities = await C.legalEntities.find({ id: { $in: maps.map((m) => m.legalEntityId) }, status: "active" }).toArray();
+  const rows = maps
+    .flatMap((m) => {
+      const e = entities.find((x) => x.id === m.legalEntityId);
+      return e
+        ? [{ mappingId: m.id, scope: m.scope, isDefault: m.isDefault, id: e.id, registeredName: e.registeredName, internalCode: e.internalCode, jurisdiction: e.jurisdiction, baseCurrency: e.baseCurrency, permittedTypes: e.permittedTransactionTypes }]
+        : [];
     })
-    .from(brandLegalEntities)
-    .innerJoin(legalEntities, eq(legalEntities.id, brandLegalEntities.legalEntityId))
-    .where(
-      and(
-        eq(brandLegalEntities.brandId, brandId),
-        inArray(brandLegalEntities.scope, [scope, "all"]),
-        lte(brandLegalEntities.effectiveFrom, day),
-        or(isNull(brandLegalEntities.effectiveTo), gte(brandLegalEntities.effectiveTo, day)),
-        eq(legalEntities.status, "active"),
-      ),
-    )
-    .orderBy(asc(legalEntities.id));
+    .sort((a, b) => a.id.localeCompare(b.id));
 
   const byId = new Map<string, PermittedEntity>();
   for (const r of rows) {
@@ -90,7 +76,7 @@ export async function getPermittedEntities(brandId: string, scope: EntityScope, 
   // Brands without any mapping (e.g. newly created ones) fall back to every active
   // LLC that may book this transaction type, so financial records always carry one.
   if (list.length === 0) {
-    const fallback = await conn.select().from(legalEntities).where(eq(legalEntities.status, "active")).orderBy(asc(legalEntities.id));
+    const fallback = await C.legalEntities.find({ status: "active" }, { sort: { id: 1 } }).toArray();
     for (const e of fallback) {
       if (!e.permittedTransactionTypes.includes(REQUIRED_TXN_TYPE[scope])) continue;
       list.push({
@@ -113,7 +99,7 @@ export async function getPermittedEntities(brandId: string, scope: EntityScope, 
 }
 
 /** Convenience: the default permitted entity, or null when the brand has no mapping for that date. */
-export async function getDefaultEntity(brandId: string, scope: EntityScope, at: Date, db?: DbOrTx) {
-  const list = await getPermittedEntities(brandId, scope, at, db);
+export async function getDefaultEntity(brandId: string, scope: EntityScope, at: Date) {
+  const list = await getPermittedEntities(brandId, scope, at);
   return list.find((e) => e.isDefault) ?? null;
 }

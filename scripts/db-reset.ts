@@ -1,29 +1,31 @@
 /**
- * Recreates the local demo database from scratch.
- * Stop `next dev` first — PGlite holds an exclusive lock on .data/pglite.
+ * Recreates the LOCAL demo database from the deterministic seed.
+ * Works while `npm run dev` is running (it re-uses that local MongoDB).
+ * Refuses to touch a hosted database (MONGODB_URI) — use `npm run db:setup` for that.
  *
  *   npm run db:reset
  */
-import { rmSync } from "node:fs";
-import { sql } from "drizzle-orm";
-import { createPgliteDb, DATA_DIR } from "../lib/db/client";
+import { connectMongo, DATA_DIR, usingLocalMongo } from "../lib/db/client";
+import { collectionName, makeCollections, runTransaction, TABLES, type TableKey } from "../lib/db/collections";
+import { ensureIndexes } from "../lib/db/indexes";
 import { seedDatabase } from "../lib/db/seed";
 
 async function main() {
-  rmSync(DATA_DIR, { recursive: true, force: true });
+  if (!usingLocalMongo()) throw new Error("db:reset only resets the local demo database. Unset MONGODB_URI.");
   const started = Date.now();
-  const { db, client } = await createPgliteDb();
-  await seedDatabase(db);
-  const tables = [
-    "users", "brands", "legal_entities", "brand_legal_entities", "customers", "customer_brand_relationships",
-    "duplicate_candidates", "leads", "sales", "invoices", "transactions", "chargeback_cases", "chargeback_events",
-    "financial_adjustments", "reconciliation_records", "integration_runs", "activity_logs", "notifications",
-  ];
-  for (const t of tables) {
-    const r = await db.execute<{ n: number }>(sql.raw(`select count(*)::int as n from ${t}`));
-    console.log(`${t.padEnd(30)} ${r.rows[0].n}`);
+  const conn = await connectMongo();
+  try {
+    await conn.db.dropDatabase();
+    await ensureIndexes(conn.db);
+    const C = makeCollections(conn.db);
+    await runTransaction(conn.client, () => seedDatabase(C));
+    for (const k of Object.keys(TABLES) as TableKey[]) {
+      const n = await C[k].countDocuments();
+      if (n) console.log(`${collectionName(k).padEnd(30)} ${n}`);
+    }
+  } finally {
+    await conn.close();
   }
-  await client.close();
   console.log(`\nDemo database ready in ${((Date.now() - started) / 1000).toFixed(1)}s at ${DATA_DIR}`);
 }
 

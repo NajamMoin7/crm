@@ -6,8 +6,8 @@ const nextConfig: NextConfig = {
   },
   cacheComponents: true,
   partialPrefetching: true,
-  // PGlite ships WASM + data files resolved relative to the package; keep it out of the bundle.
-  serverExternalPackages: ["@electric-sql/pglite"],
+  // Database drivers load native/optional modules at runtime; keep them out of the bundle.
+  serverExternalPackages: ["mongodb", "mongodb-memory-server-core"],
   poweredByHeader: false,
   // Old URL: accounts are managed on the Agents page.
   redirects: async () => [{ source: "/admin/users/:path*", destination: "/admin/agents/:path*", permanent: false }],

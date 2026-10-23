@@ -1,15 +1,8 @@
 import "server-only";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
-import type { DbOrTx } from "@/lib/db";
-import {
-  brands,
-  salesAgents,
-  systemSettings,
-  userBrandAccess,
-  userRoles,
-  users } from "@/lib/db/schema";
+import { getDb } from "@/lib/db";
+import { equalsCi } from "@/lib/db/query";
 import { nextId } from "@/lib/db/ids";
 import { logActivity } from "@/lib/audit";
 import { BusinessRuleError } from "@/lib/actions";
@@ -71,8 +64,9 @@ export const updateUserSchema = z.object({ ...userCore, status: z.enum(["active"
 export type UpdateUserInput = z.input<typeof updateUserSchema>;
 
 /** Super Admins get all brands; agents get the validated subset they were assigned. */
-async function resolveBrands(tx: DbOrTx, role: "super_admin" | "sales_agent", requested: string[]) {
-  const all = await tx.select({ id: brands.id }).from(brands);
+async function resolveBrands(role: "super_admin" | "sales_agent", requested: string[]) {
+  const C = await getDb();
+  const all = await C.brands.find({}, { projection: { id: 1 } }).toArray();
   if (role === "super_admin") return all.map((b) => b.id);
   const ids = [...new Set(requested)];
   if (ids.length === 0) throw new BusinessRuleError("Assign at least one brand to the sales agent.", { brandIds: ["Assign at least one brand."] });
@@ -80,49 +74,45 @@ async function resolveBrands(tx: DbOrTx, role: "super_admin" | "sales_agent", re
   return ids;
 }
 
-async function otherActiveSuperAdmins(tx: DbOrTx, excludeUserId: string) {
-  const [{ n }] = await tx
-    .select({ n: sql<number>`count(*)::int` })
-    .from(userRoles)
-    .innerJoin(users, eq(users.id, userRoles.userId))
-    .where(and(eq(userRoles.roleId, "super_admin"), eq(users.status, "active"), ne(users.id, excludeUserId)));
-  return n;
+async function otherActiveSuperAdmins(excludeUserId: string) {
+  const C = await getDb();
+  const admins = await C.userRoles.distinct("userId", { roleId: "super_admin" });
+  return C.users.countDocuments({ id: { $in: admins.filter((u) => u !== excludeUserId) }, status: "active" });
 }
 
-async function assertEmailFree(tx: DbOrTx, email: string, exceptId?: string) {
-  const [dupe] = await tx
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(sql`lower(${users.email})`, email), exceptId ? ne(users.id, exceptId) : undefined));
+async function assertEmailFree(email: string, exceptId?: string) {
+  const C = await getDb();
+  const dupe = await C.users.findOne({ email: equalsCi(email), ...(exceptId ? { id: { $ne: exceptId } } : {}) }, { projection: { id: 1 } });
   if (dupe) throw new BusinessRuleError("A user with this email already exists.", { email: ["Email already in use."] });
 }
 
 /** Agents need a sales_agents profile (agent code) for attribution and filters. */
-async function ensureAgentProfile(tx: DbOrTx, userId: string) {
-  const [existing] = await tx.select({ code: salesAgents.agentCode }).from(salesAgents).where(eq(salesAgents.userId, userId));
-  if (existing) return existing.code;
-  const res = await tx.execute<{ n: number }>(
-    sql`select coalesce(max(nullif(regexp_replace(agent_code, '[^0-9]', '', 'g'), '')::int), 0)::int as n from sales_agents`,
-  );
-  const agentCode = `AG-${String(Number(res.rows[0]?.n ?? 0) + 1).padStart(3, "0")}`;
-  await tx.insert(salesAgents).values({ userId, agentCode, team: "Sales", monthlyTarget: "0.00", hireDate: new Date().toISOString().slice(0, 10), managerId: null });
+async function ensureAgentProfile(userId: string) {
+  const C = await getDb();
+  const existing = await C.salesAgents.findOne({ userId });
+  if (existing) return existing.agentCode;
+  const codes = await C.salesAgents.distinct("agentCode");
+  const max = codes.reduce((m, c) => Math.max(m, Number(String(c).replace(/[^0-9]/g, "")) || 0), 0);
+  const agentCode = `AG-${String(max + 1).padStart(3, "0")}`;
+  await C.salesAgents.insertOne({ userId, agentCode, team: "Sales", monthlyTarget: "0.00", hireDate: new Date().toISOString().slice(0, 10), managerId: null });
   return agentCode;
 }
 
-export async function createUser(tx: DbOrTx, viewer: Viewer, raw: CreateUserInput) {
+export async function createUser(viewer: Viewer, raw: CreateUserInput) {
   const input = createUserSchema.parse(raw);
-  await assertEmailFree(tx, input.email);
-  const brandIds = await resolveBrands(tx, input.role, input.brandIds);
+  const C = await getDb();
+  await assertEmailFree(input.email);
+  const brandIds = await resolveBrands(input.role, input.brandIds);
 
-  const id = await nextId(tx, "user");
+  const id = await nextId("user");
   const passwordHash = await bcrypt.hash(input.password, 10);
   const now = new Date();
-  await tx.insert(users).values({ id, email: input.email, name: input.name, passwordHash, status: "active", createdAt: now, updatedAt: now });
-  await tx.insert(userRoles).values({ userId: id, roleId: input.role });
-  await tx.insert(userBrandAccess).values(brandIds.map((brandId) => ({ userId: id, brandId, grantedBy: viewer.id })));
-  const agentCode = input.role === "sales_agent" ? await ensureAgentProfile(tx, id) : null;
+  await C.users.insertOne({ id, email: input.email, name: input.name, passwordHash, status: "active", createdAt: now, updatedAt: now });
+  await C.userRoles.insertOne({ userId: id, roleId: input.role });
+  await C.userBrandAccess.insertMany(brandIds.map((brandId) => ({ userId: id, brandId, grantedBy: viewer.id })));
+  const agentCode = input.role === "sales_agent" ? await ensureAgentProfile(id) : null;
 
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: "user.created",
     entityType: "user",
@@ -134,25 +124,25 @@ export async function createUser(tx: DbOrTx, viewer: Viewer, raw: CreateUserInpu
   return { id, agentCode };
 }
 
-export async function updateUser(tx: DbOrTx, viewer: Viewer, id: string, raw: UpdateUserInput) {
+export async function updateUser(viewer: Viewer, id: string, raw: UpdateUserInput) {
   const input = updateUserSchema.parse(raw);
-  const [existing] = await tx.select().from(users).where(eq(users.id, id));
+  const C = await getDb();
+  const existing = await C.users.findOne({ id });
   if (!existing) throw new BusinessRuleError("User not found.");
-  await assertEmailFree(tx, input.email, id);
-  const [roleRows, brandRows] = await Promise.all([
-    tx.select({ v: userRoles.roleId }).from(userRoles).where(eq(userRoles.userId, id)),
-    tx.select({ v: userBrandAccess.brandId }).from(userBrandAccess).where(eq(userBrandAccess.userId, id)),
-  ]);
-  const beforeRole = roleRows.some((r) => r.v === "super_admin") ? "super_admin" : "sales_agent";
-  const beforeBrands = brandRows.map((r) => r.v);
-  const brandIds = await resolveBrands(tx, input.role, input.brandIds);
+  await assertEmailFree(input.email, id);
+  // Sequential: this runs inside a transaction.
+  const roleRows = await C.userRoles.find({ userId: id }).toArray();
+  const brandRows = await C.userBrandAccess.find({ userId: id }).toArray();
+  const beforeRole = roleRows.some((r) => r.roleId === "super_admin") ? "super_admin" : "sales_agent";
+  const beforeBrands = brandRows.map((r) => r.brandId);
+  const brandIds = await resolveBrands(input.role, input.brandIds);
 
   if (id === viewer.id) {
     if (input.status !== "active") throw new BusinessRuleError("You cannot suspend your own account.", { status: ["You cannot suspend yourself."] });
     if (input.role !== beforeRole) throw new BusinessRuleError("You cannot change your own role.", { role: ["You cannot change your own role."] });
   }
   const losesSuperAdmin = beforeRole === "super_admin" && existing.status === "active" && (input.role !== "super_admin" || input.status !== "active");
-  if (losesSuperAdmin && (await otherActiveSuperAdmins(tx, id)) === 0) {
+  if (losesSuperAdmin && (await otherActiveSuperAdmins(id)) === 0) {
     throw new BusinessRuleError("This is the last active Super Admin. Create or activate another Super Admin first.", { status: ["Last active Super Admin."] });
   }
 
@@ -163,17 +153,17 @@ export async function updateUser(tx: DbOrTx, viewer: Viewer, id: string, raw: Up
   if (Object.keys(changes).length === 0) return { changed: false, suspended: false };
 
   const now = new Date();
-  await tx.update(users).set({ name: input.name, email: input.email, status: input.status, updatedAt: now }).where(eq(users.id, id));
+  await C.users.updateOne({ id }, { $set: { name: input.name, email: input.email, status: input.status, updatedAt: now } });
   if (changes.role) {
-    await tx.delete(userRoles).where(eq(userRoles.userId, id));
-    await tx.insert(userRoles).values({ userId: id, roleId: input.role });
+    await C.userRoles.deleteMany({ userId: id });
+    await C.userRoles.insertOne({ userId: id, roleId: input.role });
   }
   const b = setDiff(beforeBrands, brandIds);
-  if (b.removed.length) await tx.delete(userBrandAccess).where(and(eq(userBrandAccess.userId, id), inArray(userBrandAccess.brandId, b.removed)));
-  if (b.added.length) await tx.insert(userBrandAccess).values(b.added.map((brandId) => ({ userId: id, brandId, grantedBy: viewer.id })));
-  if (input.role === "sales_agent") await ensureAgentProfile(tx, id);
+  if (b.removed.length) await C.userBrandAccess.deleteMany({ userId: id, brandId: { $in: b.removed } });
+  if (b.added.length) await C.userBrandAccess.insertMany(b.added.map((brandId) => ({ userId: id, brandId, grantedBy: viewer.id })));
+  if (input.role === "sales_agent") await ensureAgentProfile(id);
 
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: changes.role ? "user.role_changed" : "user.updated",
     entityType: "user",
@@ -183,23 +173,24 @@ export async function updateUser(tx: DbOrTx, viewer: Viewer, id: string, raw: Up
   });
   const suspended = existing.status !== "suspended" && input.status === "suspended";
   if (suspended) {
-    await logActivity(tx, { actorId: viewer.id, action: "user.suspended", entityType: "user", entityId: id, summary: `${existing.name} suspended; all sessions revoked` });
+    await logActivity({ actorId: viewer.id, action: "user.suspended", entityType: "user", entityId: id, summary: `${existing.name} suspended; all sessions revoked` });
   } else if (existing.status === "suspended" && input.status === "active") {
-    await logActivity(tx, { actorId: viewer.id, action: "user.reactivated", entityType: "user", entityId: id, summary: `${existing.name} reactivated` });
+    await logActivity({ actorId: viewer.id, action: "user.reactivated", entityType: "user", entityId: id, summary: `${existing.name} reactivated` });
   }
   // Role / brand changes apply on the user's next request (the viewer is rebuilt from the DB each time).
   return { changed: true, suspended };
 }
 
 
-export async function resetUserPassword(tx: DbOrTx, viewer: Viewer, id: string, rawPassword: string) {
+export async function resetUserPassword(viewer: Viewer, id: string, rawPassword: string) {
   const password = passwordSchema.parse(rawPassword);
   if (id === viewer.id) throw new BusinessRuleError("You can't reset your own password from the admin console.");
-  const [existing] = await tx.select({ id: users.id, name: users.name }).from(users).where(eq(users.id, id));
+  const C = await getDb();
+  const existing = await C.users.findOne({ id }, { projection: { id: 1, name: 1 } });
   if (!existing) throw new BusinessRuleError("User not found.");
   const passwordHash = await bcrypt.hash(password, 10);
-  await tx.update(users).set({ passwordHash, failedLoginCount: 0, lockedUntil: null, updatedAt: new Date() }).where(eq(users.id, id));
-  await logActivity(tx, {
+  await C.users.updateOne({ id }, { $set: { passwordHash, failedLoginCount: 0, lockedUntil: null, updatedAt: new Date() } });
+  await logActivity({
     actorId: viewer.id,
     action: "user.password_reset",
     entityType: "user",
@@ -244,10 +235,11 @@ function settingSchema(key: string, meta: SettingMeta) {
   return z.string().trim().min(1, "Required.").max(200);
 }
 
-export async function updateSettings(tx: DbOrTx, viewer: Viewer, values: Record<string, unknown>) {
+export async function updateSettings(viewer: Viewer, values: Record<string, unknown>) {
   const keys = Object.keys(values);
   if (!keys.length) return { changed: [] as string[] };
-  const rows = await tx.select().from(systemSettings).where(inArray(systemSettings.key, keys));
+  const C = await getDb();
+  const rows = await C.systemSettings.find({ key: { $in: keys } }).toArray();
   const fieldErrors: Record<string, string[]> = {};
   const updates: { key: string; from: unknown; to: unknown }[] = [];
   for (const key of keys) {
@@ -266,8 +258,8 @@ export async function updateSettings(tx: DbOrTx, viewer: Viewer, values: Record<
   if (Object.keys(fieldErrors).length) throw new BusinessRuleError("Please correct the highlighted settings.", fieldErrors);
   const now = new Date();
   for (const u of updates) {
-    await tx.update(systemSettings).set({ value: u.to, updatedBy: viewer.id, updatedAt: now }).where(eq(systemSettings.key, u.key));
-    await logActivity(tx, {
+    await C.systemSettings.updateOne({ key: u.key }, { $set: { value: u.to, updatedBy: viewer.id, updatedAt: now } });
+    await logActivity({
       actorId: viewer.id,
       action: "settings.updated",
       entityType: "setting",

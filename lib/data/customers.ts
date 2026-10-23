@@ -1,185 +1,176 @@
 import "server-only";
-import { and, asc, count, desc, eq, ilike, inArray, isNull, ne, or, sql, sum } from "drizzle-orm";
-import { getDb } from "@/lib/db";
-import {
-  activityLogs,
-  chargebackCases,
-  customerBrandRelationships,
-  customers,
-  duplicateCandidates,
-  invoices,
-  notes,
-  sales,
-  transactions,
-  users,
-} from "@/lib/db/schema";
+import type { Filter } from "mongodb";
+import { getDb, type RowOf } from "@/lib/db";
+import { contains, decStr, equalsCi, ids, sumDec, uniq } from "@/lib/db/query";
 import { brandFilter, scopeCases, scopeCustomers, scopeInvoices, scopeSales } from "@/lib/auth/scope";
 import { can, type Viewer } from "@/lib/auth/viewer";
 import { PAGE_SIZE, type ListFilters } from "@/lib/filters";
 
-export function customerSearchCond(q: string) {
+type CustomerFilter = Filter<RowOf<"customers">>;
+
+export function customerSearchCond(q: string): CustomerFilter | undefined {
   if (!q) return undefined;
-  const like = `%${q.replace(/[%_]/g, "")}%`;
+  const like = contains(q);
   const digits = q.replace(/\D/g, "");
-  return or(
-    ilike(customers.id, like),
-    ilike(customers.fullName, like),
-    ilike(customers.email, like),
-    ilike(customers.companyName, like),
-    digits.length >= 4 ? ilike(customers.phoneNormalized, `%${digits}%`) : undefined,
-  );
+  return {
+    $or: [
+      { id: like },
+      { fullName: like },
+      { email: like },
+      { companyName: like },
+      ...(digits.length >= 4 ? [{ phoneNormalized: contains(digits) }] : []),
+    ],
+  };
 }
 
-export function customerListWhere(viewer: Viewer, f: ListFilters) {
-  return and(
-    scopeCustomers(viewer, f.brand),
-    customerSearchCond(f.q),
-    f.status ? eq(customers.status, f.status as never) : undefined,
-    f.agent ? eq(customers.assignedAgentId, f.agent) : undefined,
-    f.from ? sql`${customers.createdAt} >= ${f.from}` : undefined,
-    f.to ? sql`${customers.createdAt} <= ${f.to}` : undefined,
-  );
+/** Filter for the customer list (async: scoping reads brand links and sales). */
+export async function customerListWhere(viewer: Viewer, f: ListFilters): Promise<CustomerFilter> {
+  const conds: CustomerFilter[] = [await scopeCustomers(viewer, f.brand)];
+  const search = customerSearchCond(f.q);
+  if (search) conds.push(search);
+  if (f.status) conds.push({ status: f.status as never });
+  if (f.agent) conds.push({ assignedAgentId: f.agent });
+  if (f.from) conds.push({ createdAt: { $gte: f.from } });
+  if (f.to) conds.push({ createdAt: { $lte: f.to } });
+  return { $and: conds };
+}
+
+/** Sorted brand ids per customer (null when none, like array_agg). */
+async function brandIdsFor(customerIds: string[]) {
+  const C = await getDb();
+  const rels = await C.customerBrandRelationships.find({ customerId: { $in: ids(customerIds) } }).toArray();
+  const map = new Map<string, string[]>();
+  for (const r of rels) (map.get(r.customerId) ?? map.set(r.customerId, []).get(r.customerId)!).push(r.brandId);
+  for (const list of map.values()) list.sort();
+  return (id: string): string[] | null => map.get(id) ?? null;
+}
+
+async function userNames(userIds: (string | null | undefined)[]) {
+  const C = await getDb();
+  const rows = await C.users.find({ id: { $in: ids(uniq(userIds)) } }, { projection: { id: 1, name: 1 } }).toArray();
+  return new Map(rows.map((u) => [u.id, u.name]));
 }
 
 export async function listCustomers(viewer: Viewer, f: ListFilters, opts: { limit?: number } = {}) {
-  const db = await getDb();
-  const where = customerListWhere(viewer, f);
+  const C = await getDb();
+  const where = await customerListWhere(viewer, f);
   const limit = opts.limit ?? PAGE_SIZE;
-  // Sales totals respect the same scope, so an agent only sees totals of their own sales.
-  const saleTotals = db
-    .select({ customerId: sales.customerId, total: sum(sales.total).as("total"), n: count().as("n") })
-    .from(sales)
-    .where(and(scopeSales(viewer, f.brand), ne(sales.status, "cancelled")))
-    .groupBy(sales.customerId)
-    .as("st");
-
-  const [rows, [{ total }]] = await Promise.all([
-    db
-      .select({
-        id: customers.id,
-        fullName: customers.fullName,
-        email: customers.email,
-        phone: customers.phone,
-        companyName: customers.companyName,
-        country: customers.country,
-        status: customers.status,
-        assignedAgentId: customers.assignedAgentId,
-        agentName: users.name,
-        lastActivityAt: customers.lastActivityAt,
-        createdAt: customers.createdAt,
-        salesTotal: saleTotals.total,
-        salesCount: saleTotals.n,
-        brandIds: sql<string[]>`(select array_agg(${customerBrandRelationships.brandId} order by ${customerBrandRelationships.brandId}) from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id})`,
-      })
-      .from(customers)
-      .leftJoin(users, eq(users.id, customers.assignedAgentId))
-      .leftJoin(saleTotals, eq(saleTotals.customerId, customers.id))
-      .where(where)
-      .orderBy(desc(customers.lastActivityAt), asc(customers.id))
-      .limit(limit)
-      .offset((f.page - 1) * limit),
-    db.select({ total: count() }).from(customers).where(where),
+  const [page, total] = await Promise.all([
+    C.customers.find(where, { sort: { lastActivityAt: -1, id: 1 }, skip: (f.page - 1) * limit, limit }).toArray(),
+    C.customers.countDocuments(where),
   ]);
+  const pageIds = page.map((c) => c.id);
+  // Sales totals respect the same scope, so an agent only sees totals of their own sales.
+  const [totals, brandsOf, names] = await Promise.all([
+    C.sales
+      .aggregate<{ _id: string; total: unknown; n: number }>([
+        { $match: { $and: [scopeSales(viewer, f.brand), { status: { $ne: "cancelled" } }, { customerId: { $in: ids(pageIds) } }] } },
+        { $group: { _id: "$customerId", total: sumDec("$total"), n: { $sum: 1 } } },
+      ])
+      .toArray(),
+    brandIdsFor(pageIds),
+    userNames(page.map((c) => c.assignedAgentId)),
+  ]);
+  const rows = page.map((c) => {
+    const t = totals.find((x) => x._id === c.id);
+    return {
+      id: c.id,
+      fullName: c.fullName,
+      email: c.email,
+      phone: c.phone,
+      companyName: c.companyName,
+      country: c.country,
+      status: c.status,
+      assignedAgentId: c.assignedAgentId,
+      agentName: c.assignedAgentId ? (names.get(c.assignedAgentId) ?? null) : null,
+      lastActivityAt: c.lastActivityAt,
+      createdAt: c.createdAt,
+      salesTotal: t ? decStr(t.total) : null,
+      salesCount: t ? t.n : null,
+      brandIds: brandsOf(c.id),
+    };
+  });
   return { rows, total };
 }
 
 /** Loads a customer only if the viewer may see it (merged records remain viewable). */
 export async function getCustomerForViewer(viewer: Viewer, id: string) {
-  const db = await getDb();
-  const [row] = await db
-    .select()
-    .from(customers)
-    .where(and(eq(customers.id, id), scopeCustomers(viewer, null, { includeMerged: true })))
-    .limit(1);
-  return row ?? null;
+  const C = await getDb();
+  return C.customers.findOne({ $and: [{ id }, await scopeCustomers(viewer, null, { includeMerged: true })] });
 }
 
 export async function getCustomerProfile(viewer: Viewer, id: string) {
-  const db = await getDb();
+  const C = await getDb();
   const customer = await getCustomerForViewer(viewer, id);
   if (!customer) return null;
 
-  const [brandRels, saleRows, invoiceRows, caseRows, paymentRows, noteRows, activity, agent, dupes] = await Promise.all([
-    db.select().from(customerBrandRelationships).where(eq(customerBrandRelationships.customerId, id)),
-    db
-      .select({
-        id: sales.id, brandId: sales.brandId, agentId: sales.agentId, agentName: users.name, legalEntityId: sales.legalEntityId,
-        saleDate: sales.saleDate, total: sales.total, currency: sales.currency, status: sales.status,
-      })
-      .from(sales)
-      .leftJoin(users, eq(users.id, sales.agentId))
-      .where(and(eq(sales.customerId, id), scopeSales(viewer)))
-      .orderBy(desc(sales.saleDate)),
+  const [brandRels, saleDocs, invoiceRows, caseRows, paymentRows, noteDocs, activityDocs, agent, dupes] = await Promise.all([
+    C.customerBrandRelationships.find({ customerId: id }).toArray(),
+    C.sales.find({ $and: [{ customerId: id }, scopeSales(viewer)] }, { sort: { saleDate: -1 } }).toArray(),
     can(viewer, "billing.view")
-      ? db
-          .select({
-            id: invoices.id, invoiceNumber: invoices.invoiceNumber, brandId: invoices.brandId, legalEntityId: invoices.legalEntityId,
-            billingDate: invoices.billingDate, dueDate: invoices.dueDate, total: invoices.total, amountPaid: invoices.amountPaid,
-            currency: invoices.currency, status: invoices.status, paymentMethod: invoices.paymentMethod,
-          })
-          .from(invoices)
-          .where(and(eq(invoices.customerId, id), scopeInvoices(viewer)))
-          .orderBy(desc(invoices.billingDate))
+      ? C.invoices
+          .find({ $and: [{ customerId: id }, scopeInvoices(viewer)] }, { sort: { billingDate: -1 } })
+          .toArray()
+          .then((rows) =>
+            rows.map((i) => ({
+              id: i.id, invoiceNumber: i.invoiceNumber, brandId: i.brandId, legalEntityId: i.legalEntityId,
+              billingDate: i.billingDate, dueDate: i.dueDate, total: i.total, amountPaid: i.amountPaid,
+              currency: i.currency, status: i.status, paymentMethod: i.paymentMethod,
+            })),
+          )
       : Promise.resolve([]),
     can(viewer, "chargebacks.view")
-      ? db
-          .select({
-            id: chargebackCases.id, caseType: chargebackCases.caseType, brandId: chargebackCases.brandId, status: chargebackCases.status,
-            amount: chargebackCases.amount, currency: chargebackCases.currency, reasonCode: chargebackCases.reasonCode,
-            requestDate: chargebackCases.requestDate, invoiceId: chargebackCases.invoiceId,
-            originalLegalEntityId: chargebackCases.originalLegalEntityId, responsibleLegalEntityId: chargebackCases.responsibleLegalEntityId,
-          })
-          .from(chargebackCases)
-          .where(and(eq(chargebackCases.customerId, id), scopeCases(viewer)))
-          .orderBy(desc(chargebackCases.requestDate))
+      ? C.chargebackCases
+          .find({ $and: [{ customerId: id }, scopeCases(viewer)] }, { sort: { requestDate: -1 } })
+          .toArray()
+          .then((rows) =>
+            rows.map((k) => ({
+              id: k.id, caseType: k.caseType, brandId: k.brandId, status: k.status, amount: k.amount, currency: k.currency,
+              reasonCode: k.reasonCode, requestDate: k.requestDate, invoiceId: k.invoiceId,
+              originalLegalEntityId: k.originalLegalEntityId, responsibleLegalEntityId: k.responsibleLegalEntityId,
+            })),
+          )
       : Promise.resolve([]),
     can(viewer, "billing.view")
-      ? db
-          .select({
-            id: transactions.id, type: transactions.type, status: transactions.status, amount: transactions.amount,
-            currency: transactions.currency, paymentReference: transactions.paymentReference, occurredAt: transactions.occurredAt,
-            invoiceId: transactions.invoiceId, brandId: transactions.brandId, method: transactions.paymentMethod,
-          })
-          .from(transactions)
-          .innerJoin(invoices, eq(invoices.id, transactions.invoiceId))
-          .where(and(eq(invoices.customerId, id), scopeInvoices(viewer)))
-          .orderBy(desc(transactions.occurredAt))
+      ? (async () => {
+          const invIds = await C.invoices.distinct("id", { $and: [{ customerId: id }, scopeInvoices(viewer)] });
+          const txns = await C.transactions.find({ invoiceId: { $in: ids(invIds) } }, { sort: { occurredAt: -1 } }).toArray();
+          return txns.map((t) => ({
+            id: t.id, type: t.type, status: t.status, amount: t.amount, currency: t.currency, paymentReference: t.paymentReference,
+            occurredAt: t.occurredAt, invoiceId: t.invoiceId, brandId: t.brandId, method: t.paymentMethod,
+          }));
+        })()
       : Promise.resolve([]),
-    db
-      .select({ id: notes.id, body: notes.body, visibility: notes.visibility, createdAt: notes.createdAt, author: users.name })
-      .from(notes)
-      .leftJoin(users, eq(users.id, notes.authorId))
-      .where(
-        and(
-          eq(notes.entityType, "customer"),
-          eq(notes.entityId, id),
-          can(viewer, "transactions.view") ? undefined : eq(notes.visibility, "internal"),
-        ),
+    C.notes
+      .find(
+        { entityType: "customer", entityId: id, ...(can(viewer, "transactions.view") ? {} : { visibility: "internal" }) },
+        { sort: { createdAt: -1 } },
       )
-      .orderBy(desc(notes.createdAt)),
-    db
-      .select({ id: activityLogs.id, action: activityLogs.action, summary: activityLogs.summary, createdAt: activityLogs.createdAt, actor: users.name })
-      .from(activityLogs)
-      .leftJoin(users, eq(users.id, activityLogs.actorId))
-      .where(
-        or(
-          and(eq(activityLogs.entityType, "customer"), eq(activityLogs.entityId, id)),
-          sql`${activityLogs.metadata} ->> 'customerId' = ${id}`,
-        ),
-      )
-      .orderBy(desc(activityLogs.createdAt))
-      .limit(50),
+      .toArray(),
+    C.activityLogs
+      .find({ $or: [{ entityType: "customer", entityId: id }, { "metadata.customerId": id }] }, { sort: { createdAt: -1 }, limit: 50 })
+      .toArray(),
     customer.assignedAgentId
-      ? db.select({ id: users.id, name: users.name, email: users.email }).from(users).where(eq(users.id, customer.assignedAgentId)).then((r) => r[0] ?? null)
+      ? C.users.findOne({ id: customer.assignedAgentId }, { projection: { id: 1, name: 1, email: 1 } }).then((u) => (u ? { id: u.id, name: u.name, email: u.email } : null))
       : Promise.resolve(null),
-    db
-      .select()
-      .from(duplicateCandidates)
-      .where(and(eq(duplicateCandidates.status, "open"), or(eq(duplicateCandidates.customerAId, id), eq(duplicateCandidates.customerBId, id)))),
+    C.duplicateCandidates.find({ status: "open", $or: [{ customerAId: id }, { customerBId: id }] }).toArray(),
   ]);
+  const names = await userNames([...saleDocs.map((s) => s.agentId), ...noteDocs.map((n) => n.authorId), ...activityDocs.map((a) => a.actorId)]);
+  const saleRows = saleDocs.map((s) => ({
+    id: s.id, brandId: s.brandId, agentId: s.agentId, agentName: names.get(s.agentId) ?? null, legalEntityId: s.legalEntityId,
+    saleDate: s.saleDate, total: s.total, currency: s.currency, status: s.status,
+  }));
+  const noteRows = noteDocs.map((n) => ({ id: n.id, body: n.body, visibility: n.visibility, createdAt: n.createdAt, author: names.get(n.authorId) ?? null }));
+  const activity = activityDocs.map((a) => ({
+    id: a.id, action: a.action, summary: a.summary, createdAt: a.createdAt, actor: a.actorId ? (names.get(a.actorId) ?? null) : null,
+  }));
 
   return { customer, brandRels, saleRows, invoiceRows, caseRows, paymentRows, noteRows, activity, agent, dupes };
 }
+
+/** Last 10 digits of a phone, for "right(phone, 10)" comparisons. */
+const last10 = (digits: string) => digits.slice(-10);
+const endsWith = (digits: string) => new RegExp(`${last10(digits)}$`);
 
 /**
  * Identity matching used before creating a customer or billing record.
@@ -194,53 +185,51 @@ export async function findCustomerMatches(
   /** global: search every customer (duplicate prevention); callers must mask what the viewer can't see. */
   opts: { global?: boolean } = {},
 ) {
-  const db = await getDb();
+  const C = await getDb();
   const brandIds = brandFilter(viewer, null);
-  const conds = [];
+  const conds: CustomerFilter[] = [];
   const q = input.query?.trim() ?? "";
   if (q) {
-    conds.push(eq(sql`upper(${customers.id})`, q.toUpperCase()));
-    if (q.includes("@")) conds.push(eq(sql`lower(${customers.email})`, q.toLowerCase()));
+    conds.push({ id: equalsCi(q) });
+    if (q.includes("@")) conds.push({ email: equalsCi(q) });
     const digits = q.replace(/\D/g, "");
-    if (digits.length >= 7) conds.push(sql`right(${customers.phoneNormalized}, 10) = right(${digits}, 10)`);
-    if (q.length >= 3 && !q.includes("@") && digits.length < 4) conds.push(ilike(customers.fullName, `%${q.replace(/[%_]/g, "")}%`));
+    if (digits.length >= 7) conds.push({ phoneNormalized: endsWith(digits) });
+    if (q.length >= 3 && !q.includes("@") && digits.length < 4) conds.push({ fullName: contains(q) });
   }
-  if (input.email) conds.push(eq(sql`lower(${customers.email})`, input.email.trim().toLowerCase()));
+  if (input.email) conds.push({ email: equalsCi(input.email.trim()) });
   if (input.phone) {
     const d = input.phone.replace(/\D/g, "");
-    if (d.length >= 7) conds.push(sql`right(${customers.phoneNormalized}, 10) = right(${d}, 10)`);
+    if (d.length >= 7) conds.push({ phoneNormalized: endsWith(d) });
   }
-  if (input.name && input.name.trim().length >= 3) conds.push(sql`lower(${customers.fullName}) = ${input.name.trim().toLowerCase()}`);
+  if (input.name && input.name.trim().length >= 3) conds.push({ fullName: equalsCi(input.name.trim()) });
   if (conds.length === 0) return [];
 
-  const rows = await db
-    .select({
-      id: customers.id,
-      fullName: customers.fullName,
-      email: customers.email,
-      phone: customers.phone,
-      phoneNormalized: customers.phoneNormalized,
-      companyName: customers.companyName,
-      billingAddress: customers.billingAddress,
-      country: customers.country,
-      assignedAgentId: customers.assignedAgentId,
-      mergedIntoId: customers.mergedIntoId,
-      brandIds: sql<string[]>`(select array_agg(${customerBrandRelationships.brandId}) from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id})`,
-    })
-    .from(customers)
-    .where(
-      and(
-        or(...conds),
-        isNull(customers.archivedAt),
-        opts.global
-          ? undefined
-          : // In the viewer's brands — or not yet billed under any brand.
-            sql`(exists (select 1 from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id} and ${inArray(customerBrandRelationships.brandId, brandIds)}) or not exists (select 1 from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id}))`,
-      ),
-    )
-    .limit(10);
+  const where: CustomerFilter[] = [{ $or: conds }, { archivedAt: null }];
+  if (!opts.global) {
+    // In the viewer's brands — or not yet billed under any brand.
+    const [inBrands, linked] = await Promise.all([
+      C.customerBrandRelationships.distinct("customerId", { brandId: { $in: brandIds } }),
+      C.customerBrandRelationships.distinct("customerId"),
+    ]);
+    where.push({ $or: [{ id: { $in: ids(inBrands) } }, { id: { $nin: linked } }] });
+  }
+  const docs = await C.customers.find({ $and: where }, { limit: 10 }).toArray();
+  const brandsOf = await brandIdsFor(docs.map((d) => d.id));
 
-  return rows.map((r) => {
+  return docs.map((d) => {
+    const r = {
+      id: d.id,
+      fullName: d.fullName,
+      email: d.email,
+      phone: d.phone,
+      phoneNormalized: d.phoneNormalized,
+      companyName: d.companyName,
+      billingAddress: d.billingAddress,
+      country: d.country,
+      assignedAgentId: d.assignedAgentId,
+      mergedIntoId: d.mergedIntoId,
+      brandIds: brandsOf(d.id),
+    };
     const reasons: string[] = [];
     if (q && r.id.toUpperCase() === q.toUpperCase()) reasons.push("Customer ID");
     const email = (input.email ?? (q.includes("@") ? q : "")).toLowerCase();
@@ -253,26 +242,30 @@ export async function findCustomerMatches(
 }
 
 export async function listDuplicateCandidates(viewer: Viewer, status = "open") {
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(duplicateCandidates)
-    .where(eq(duplicateCandidates.status, status as never))
-    .orderBy(desc(duplicateCandidates.score));
-  const ids = [...new Set(rows.flatMap((r) => [r.customerAId, r.customerBId]))];
-  const custs = ids.length
-    ? await db
-        .select({
-          id: customers.id, fullName: customers.fullName, email: customers.email, phone: customers.phone, companyName: customers.companyName,
-          city: customers.city, country: customers.country, createdAt: customers.createdAt, acquisitionSource: customers.acquisitionSource,
-          mergedIntoId: customers.mergedIntoId,
-          brandIds: sql<string[]>`(select array_agg(${customerBrandRelationships.brandId}) from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id})`,
-          salesCount: sql<number>`(select count(*)::int from sales s where s.customer_id = "customers"."id")`,
-          invoiceCount: sql<number>`(select count(*)::int from invoices i where i.customer_id = "customers"."id")`,
-        })
-        .from(customers)
-        .where(and(inArray(customers.id, ids), scopeCustomers(viewer, null, { includeMerged: true })))
-    : [];
+  const C = await getDb();
+  const rows = await C.duplicateCandidates.find({ status: status as never }, { sort: { score: -1 } }).toArray();
+  const pairIds = [...new Set(rows.flatMap((r) => [r.customerAId, r.customerBId]))];
+  let custs: {
+    id: string; fullName: string; email: string | null; phone: string | null; companyName: string | null; city: string | null;
+    country: string | null; createdAt: Date; acquisitionSource: string | null; mergedIntoId: string | null;
+    brandIds: string[] | null; salesCount: number; invoiceCount: number;
+  }[] = [];
+  if (pairIds.length) {
+    const docs = await C.customers.find({ $and: [{ id: { $in: pairIds } }, await scopeCustomers(viewer, null, { includeMerged: true })] }).toArray();
+    const docIds = docs.map((d) => d.id);
+    const [brandsOf, saleCounts, invoiceCounts] = await Promise.all([
+      brandIdsFor(docIds),
+      C.sales.aggregate<{ _id: string; n: number }>([{ $match: { customerId: { $in: ids(docIds) } } }, { $group: { _id: "$customerId", n: { $sum: 1 } } }]).toArray(),
+      C.invoices.aggregate<{ _id: string; n: number }>([{ $match: { customerId: { $in: ids(docIds) } } }, { $group: { _id: "$customerId", n: { $sum: 1 } } }]).toArray(),
+    ]);
+    custs = docs.map((c) => ({
+      id: c.id, fullName: c.fullName, email: c.email, phone: c.phone, companyName: c.companyName, city: c.city, country: c.country,
+      createdAt: c.createdAt, acquisitionSource: c.acquisitionSource, mergedIntoId: c.mergedIntoId,
+      brandIds: brandsOf(c.id),
+      salesCount: saleCounts.find((x) => x._id === c.id)?.n ?? 0,
+      invoiceCount: invoiceCounts.find((x) => x._id === c.id)?.n ?? 0,
+    }));
+  }
   const map = new Map(custs.map((c) => [c.id, c]));
   // Pairs where either record is outside the viewer's scope are hidden entirely.
   return rows.filter((r) => map.has(r.customerAId) && map.has(r.customerBId)).map((r) => ({ ...r, a: map.get(r.customerAId)!, b: map.get(r.customerBId)! }));

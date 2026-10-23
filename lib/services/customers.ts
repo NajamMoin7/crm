@@ -1,19 +1,6 @@
 import "server-only";
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import type { DbOrTx } from "@/lib/db";
-import {
-  chargebackCases,
-  customerBrandRelationships,
-  customerMergeHistory,
-  customers,
-  duplicateCandidates,
-  invoices,
-  leads,
-  notes,
-  sales,
-  tasks,
-  users,
-} from "@/lib/db/schema";
+import { getDb } from "@/lib/db";
+import { ids } from "@/lib/db/query";
 import { nextId } from "@/lib/db/ids";
 import { logActivity, notify } from "@/lib/audit";
 import { BusinessRuleError } from "@/lib/actions";
@@ -31,13 +18,14 @@ export type CreatedCustomer = { id: string; fullName: string; possibleDuplicates
  * person, and even then a duplicate-review candidate is registered.
  * The brand association is created when the customer is first billed.
  */
-export async function createCustomer(tx: DbOrTx, viewer: Viewer, raw: CustomerInput): Promise<CreatedCustomer> {
+export async function createCustomer(viewer: Viewer, raw: CustomerInput): Promise<CreatedCustomer> {
   if (!can(viewer, "customers.create")) throw new BusinessRuleError("You do not have permission to create customers.");
   const input = customerSchema.parse(raw);
+  const C = await getDb();
 
   let assignedAgentId = viewer.id;
   if (input.assignedAgentId && input.assignedAgentId !== viewer.id && can(viewer, "agents.manage")) {
-    const [agent] = await tx.select({ id: users.id, status: users.status }).from(users).where(eq(users.id, input.assignedAgentId));
+    const agent = await C.users.findOne({ id: input.assignedAgentId }, { projection: { id: 1, status: 1 } });
     if (!agent || agent.status !== "active") throw new BusinessRuleError("The selected agent is not active.", { assignedAgentId: ["Choose an active agent."] });
     assignedAgentId = agent.id;
   }
@@ -53,9 +41,9 @@ export async function createCustomer(tx: DbOrTx, viewer: Viewer, raw: CustomerIn
     );
   }
 
-  const id = await nextId(tx, "customer");
+  const id = await nextId("customer");
   const now = new Date();
-  await tx.insert(customers).values({
+  await C.customers.insertOne({
     id,
     fullName: input.fullName,
     email: input.email,
@@ -71,9 +59,9 @@ export async function createCustomer(tx: DbOrTx, viewer: Viewer, raw: CustomerIn
     lastActivityAt: now,
   });
   if (input.notes) {
-    await tx.insert(notes).values({ id: await nextId(tx, "note"), entityType: "customer", entityId: id, body: input.notes, visibility: "internal", authorId: viewer.id });
+    await C.notes.insertOne({ id: await nextId("note"), entityType: "customer", entityId: id, body: input.notes, visibility: "internal", authorId: viewer.id });
   }
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: "customer.created",
     entityType: "customer",
@@ -84,28 +72,32 @@ export async function createCustomer(tx: DbOrTx, viewer: Viewer, raw: CustomerIn
 
   for (const m of matches) {
     const [a, b] = [m.id, id].sort();
-    await tx
-      .insert(duplicateCandidates)
-      .values({
-        id: await nextId(tx, "duplicate"),
-        customerAId: a,
-        customerBId: b,
-        matchReasons: m.reasons.map((r) => `${r} matches`),
-        score: m.reasons.length > 1 ? 90 : 70,
-        detectedBy: "agent",
-      })
-      .onConflictDoNothing();
+    // One candidate per pair (unique index); an existing pair is left as is.
+    if (await C.duplicateCandidates.findOne({ customerAId: a, customerBId: b }, { projection: { id: 1 } })) continue;
+    await C.duplicateCandidates.insertOne({
+      id: await nextId("duplicate"),
+      customerAId: a,
+      customerBId: b,
+      matchReasons: m.reasons.map((r) => `${r} matches`),
+      score: m.reasons.length > 1 ? 90 : 70,
+      detectedBy: "agent",
+    });
   }
   return { id, fullName: input.fullName, possibleDuplicates: matches.map((m) => m.id) };
 }
 
 /** Ensures the customer ↔ brand relationship exists (called when billing under a new brand). */
-export async function linkCustomerToBrand(tx: DbOrTx, viewer: Viewer, customerId: string, brandId: string) {
-  const res = await tx.insert(customerBrandRelationships).values({ customerId, brandId }).onConflictDoNothing().returning();
+export async function linkCustomerToBrand(viewer: Viewer, customerId: string, brandId: string) {
+  const C = await getDb();
+  const res = await C.customerBrandRelationships.updateOne(
+    { customerId, brandId },
+    { $setOnInsert: { customerId, brandId, firstSeenAt: new Date(), sourceSystemId: null } },
+    { upsert: true },
+  );
   // The first brand a customer is billed under becomes their "first brand".
-  await tx.update(customers).set({ firstBrandId: brandId }).where(and(eq(customers.id, customerId), isNull(customers.firstBrandId)));
-  if (res.length) {
-    await logActivity(tx, {
+  await C.customers.updateOne({ id: customerId, firstBrandId: null }, { $set: { firstBrandId: brandId } });
+  if (res.upsertedCount) {
+    await logActivity({
       actorId: viewer.id,
       action: "customer.brand_linked",
       entityType: "customer",
@@ -116,52 +108,65 @@ export async function linkCustomerToBrand(tx: DbOrTx, viewer: Viewer, customerId
   }
 }
 
+type Movable = { distinct(field: string, filter: object): Promise<string[]>; updateMany(filter: object, update: object): Promise<unknown> };
+
 /**
  * Controlled merge: operational records move to the survivor; the merged
- * record is retained (merged_into_id) with a full snapshot in merge history.
+ * record is retained (mergedIntoId) with a full snapshot in merge history.
  * Ledger transactions are immutable and keep their original customer id —
  * the survivor's profile follows them through the moved invoices.
  */
-export async function mergeCustomers(tx: DbOrTx, viewer: Viewer, candidateId: string, survivorId: string, reason: string) {
-  const [cand] = await tx.select().from(duplicateCandidates).where(eq(duplicateCandidates.id, candidateId));
+export async function mergeCustomers(viewer: Viewer, candidateId: string, survivorId: string, reason: string) {
+  const C = await getDb();
+  const cand = await C.duplicateCandidates.findOne({ id: candidateId });
   if (!cand || cand.status !== "open") throw new BusinessRuleError("This duplicate candidate is no longer open.");
   if (survivorId !== cand.customerAId && survivorId !== cand.customerBId) throw new BusinessRuleError("Survivor must be one of the pair.");
   const mergedId = survivorId === cand.customerAId ? cand.customerBId : cand.customerAId;
-  const [survivor] = await tx.select().from(customers).where(eq(customers.id, survivorId));
-  const [merged] = await tx.select().from(customers).where(eq(customers.id, mergedId));
+  const survivor = await C.customers.findOne({ id: survivorId });
+  const merged = await C.customers.findOne({ id: mergedId });
   if (!survivor || !merged || survivor.mergedIntoId || merged.mergedIntoId) throw new BusinessRuleError("One of these records was already merged.");
 
-  const moved = {
-    sales: (await tx.update(sales).set({ customerId: survivorId }).where(eq(sales.customerId, mergedId)).returning({ id: sales.id })).map((r) => r.id),
-    invoices: (await tx.update(invoices).set({ customerId: survivorId }).where(eq(invoices.customerId, mergedId)).returning({ id: invoices.id })).map((r) => r.id),
-    cases: (await tx.update(chargebackCases).set({ customerId: survivorId }).where(eq(chargebackCases.customerId, mergedId)).returning({ id: chargebackCases.id })).map((r) => r.id),
-    leads: (await tx.update(leads).set({ customerId: survivorId }).where(eq(leads.customerId, mergedId)).returning({ id: leads.id })).map((r) => r.id),
-    notes: (await tx.update(notes).set({ entityId: survivorId }).where(and(eq(notes.entityType, "customer"), eq(notes.entityId, mergedId))).returning({ id: notes.id })).map((r) => r.id),
-    tasks: (await tx.update(tasks).set({ entityId: survivorId }).where(and(eq(tasks.entityType, "customer"), eq(tasks.entityId, mergedId))).returning({ id: tasks.id })).map((r) => r.id),
+  // Sequential: this runs inside a transaction (one session, no concurrent operations).
+  const move = async (coll: Movable, filter: object, set: object) => {
+    const list = await coll.distinct("id", filter);
+    if (list.length) await coll.updateMany({ id: { $in: list } }, { $set: set });
+    return list;
   };
-  const rels = await tx.select().from(customerBrandRelationships).where(eq(customerBrandRelationships.customerId, mergedId));
+  const toSurvivor = { customerId: survivorId };
+  const moved = {
+    sales: await move(C.sales as unknown as Movable, { customerId: mergedId }, toSurvivor),
+    invoices: await move(C.invoices as unknown as Movable, { customerId: mergedId }, toSurvivor),
+    cases: await move(C.chargebackCases as unknown as Movable, { customerId: mergedId }, toSurvivor),
+    leads: await move(C.leads as unknown as Movable, { customerId: mergedId }, toSurvivor),
+    notes: await move(C.notes as unknown as Movable, { entityType: "customer", entityId: mergedId }, { entityId: survivorId }),
+    tasks: await move(C.tasks as unknown as Movable, { entityType: "customer", entityId: mergedId }, { entityId: survivorId }),
+  };
+  const rels = await C.customerBrandRelationships.find({ customerId: mergedId }).toArray();
   for (const r of rels) {
-    await tx
-      .insert(customerBrandRelationships)
-      .values({ customerId: survivorId, brandId: r.brandId, firstSeenAt: r.firstSeenAt, sourceSystemId: r.sourceSystemId })
-      .onConflictDoNothing();
+    await C.customerBrandRelationships.updateOne(
+      { customerId: survivorId, brandId: r.brandId },
+      { $setOnInsert: { customerId: survivorId, brandId: r.brandId, firstSeenAt: r.firstSeenAt, sourceSystemId: r.sourceSystemId } },
+      { upsert: true },
+    );
   }
   const now = new Date();
-  await tx.update(customers).set({ mergedIntoId: survivorId, status: "inactive", updatedAt: now }).where(eq(customers.id, mergedId));
-  await tx
-    .update(customers)
-    .set({
-      updatedAt: now,
-      lastActivityAt: now,
-      email: survivor.email ?? merged.email,
-      phone: survivor.phone ?? merged.phone,
-      phoneNormalized: survivor.phoneNormalized ?? merged.phoneNormalized,
-      companyName: survivor.companyName ?? merged.companyName,
-      tags: [...new Set([...survivor.tags, ...merged.tags])],
-    })
-    .where(eq(customers.id, survivorId));
-  await tx.insert(customerMergeHistory).values({
-    id: await nextId(tx, "merge"),
+  await C.customers.updateOne({ id: mergedId }, { $set: { mergedIntoId: survivorId, status: "inactive", updatedAt: now } });
+  await C.customers.updateOne(
+    { id: survivorId },
+    {
+      $set: {
+        updatedAt: now,
+        lastActivityAt: now,
+        email: survivor.email ?? merged.email,
+        phone: survivor.phone ?? merged.phone,
+        phoneNormalized: survivor.phoneNormalized ?? merged.phoneNormalized,
+        companyName: survivor.companyName ?? merged.companyName,
+        tags: [...new Set([...survivor.tags, ...merged.tags])],
+      },
+    },
+  );
+  await C.customerMergeHistory.insertOne({
+    id: await nextId("merge"),
     survivorId,
     mergedId,
     duplicateCandidateId: candidateId,
@@ -170,21 +175,16 @@ export async function mergeCustomers(tx: DbOrTx, viewer: Viewer, candidateId: st
     snapshot: merged,
     movedRecords: moved,
   });
-  await tx
-    .update(duplicateCandidates)
-    .set({ status: "merged", reviewedBy: viewer.id, reviewedAt: now, resolutionNote: reason })
-    .where(eq(duplicateCandidates.id, candidateId));
+  await C.duplicateCandidates.updateOne(
+    { id: candidateId },
+    { $set: { status: "merged", reviewedBy: viewer.id, reviewedAt: now, resolutionNote: reason } },
+  );
   // Other open candidates pointing at the merged record are re-evaluated by a human.
-  await tx
-    .update(duplicateCandidates)
-    .set({ status: "dismissed", reviewedBy: viewer.id, reviewedAt: now, resolutionNote: `Superseded by merge into ${survivorId}` })
-    .where(
-      and(
-        eq(duplicateCandidates.status, "open"),
-        or(eq(duplicateCandidates.customerAId, mergedId), eq(duplicateCandidates.customerBId, mergedId)),
-      ),
-    );
-  await logActivity(tx, {
+  await C.duplicateCandidates.updateMany(
+    { status: "open", $or: [{ customerAId: mergedId }, { customerBId: mergedId }] },
+    { $set: { status: "dismissed", reviewedBy: viewer.id, reviewedAt: now, resolutionNote: `Superseded by merge into ${survivorId}` } },
+  );
+  await logActivity({
     actorId: viewer.id,
     action: "customer.merged",
     entityType: "customer",
@@ -192,7 +192,7 @@ export async function mergeCustomers(tx: DbOrTx, viewer: Viewer, candidateId: st
     summary: `Merged ${mergedId} (${merged.fullName}) into ${survivorId}`,
     metadata: { mergedId, candidateId, reason, moved: Object.fromEntries(Object.entries(moved).map(([k, v]) => [k, v.length])) },
   });
-  await logActivity(tx, {
+  await logActivity({
     actorId: viewer.id,
     action: "customer.merged_into",
     entityType: "customer",
@@ -200,7 +200,7 @@ export async function mergeCustomers(tx: DbOrTx, viewer: Viewer, candidateId: st
     summary: `Record merged into ${survivorId}; retained read-only for audit`,
   });
   if (survivor.assignedAgentId && survivor.assignedAgentId !== viewer.id) {
-    await notify(tx, [survivor.assignedAgentId], {
+    await notify([survivor.assignedAgentId], {
       kind: "system",
       title: "Customer records merged",
       body: `${mergedId} was merged into ${survivorId} (${survivor.fullName}).`,
@@ -210,12 +210,13 @@ export async function mergeCustomers(tx: DbOrTx, viewer: Viewer, candidateId: st
   return { survivorId, mergedId, moved };
 }
 
-export async function customerIdsWithMerged(tx: DbOrTx, id: string) {
-  const rows = await tx.select({ id: customers.id }).from(customers).where(or(eq(customers.id, id), eq(customers.mergedIntoId, id)));
-  return rows.map((r) => r.id);
+export async function customerIdsWithMerged(id: string) {
+  const C = await getDb();
+  return C.customers.distinct("id", { $or: [{ id }, { mergedIntoId: id }] });
 }
 
-export async function touchCustomer(tx: DbOrTx, customerIds: string[]) {
+export async function touchCustomer(customerIds: string[]) {
   if (!customerIds.length) return;
-  await tx.update(customers).set({ lastActivityAt: sql`now()` }).where(inArray(customers.id, customerIds));
+  const C = await getDb();
+  await C.customers.updateMany({ id: { $in: ids(customerIds) } }, { $set: { lastActivityAt: new Date() } });
 }

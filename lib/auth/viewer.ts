@@ -1,17 +1,7 @@
 import "server-only";
 import { cache } from "react";
 import { redirect } from "next/navigation";
-import { eq, inArray } from "drizzle-orm";
 import { getDb } from "@/lib/db";
-import {
-  brands,
-  rolePermissions,
-  roles,
-  userBrandAccess,
-  userLegalEntityAccess,
-  userRoles,
-  users,
-} from "@/lib/db/schema";
 import type { Permission, RoleId } from "@/lib/domain/permissions";
 import { readSessionUserId } from "./session";
 
@@ -37,32 +27,34 @@ export type Viewer = {
 };
 
 async function loadViewer(userId: string): Promise<Viewer | null> {
-  const db = await getDb();
-  const [user] = await db
-    .select({ id: users.id, name: users.name, email: users.email, title: users.title, status: users.status })
-    .from(users)
-    .where(eq(users.id, userId));
+  const C = await getDb();
+  const user = await C.users.findOne({ id: userId }, { projection: { id: 1, name: 1, email: 1, title: 1, status: 1 } });
   if (!user || user.status !== "active") return null;
 
-  const [roleRows, brandRows, entityRows] = await Promise.all([
-    db.select({ id: roles.id, name: roles.name }).from(userRoles).innerJoin(roles, eq(roles.id, userRoles.roleId)).where(eq(userRoles.userId, userId)),
-    db.select({ brandId: userBrandAccess.brandId, status: brands.status }).from(userBrandAccess).innerJoin(brands, eq(brands.id, userBrandAccess.brandId)).where(eq(userBrandAccess.userId, userId)),
-    db.select({ id: userLegalEntityAccess.legalEntityId }).from(userLegalEntityAccess).where(eq(userLegalEntityAccess.userId, userId)),
+  const [userRoles, access, entityRows] = await Promise.all([
+    C.userRoles.find({ userId }).toArray(),
+    C.userBrandAccess.find({ userId }).toArray(),
+    C.userLegalEntityAccess.find({ userId }).toArray(),
   ]);
-  const roleIds = roleRows.map((r) => r.id);
-  const permRows = roleIds.length
-    ? await db.select({ key: rolePermissions.permissionKey }).from(rolePermissions).where(inArray(rolePermissions.roleId, roleIds))
-    : [];
-  const permissions = new Set(permRows.map((p) => p.key as Permission));
+  const roleIds = userRoles.map((r) => r.roleId);
+  const [roleRows, brandRows, permRows] = await Promise.all([
+    C.roles.find({ id: { $in: roleIds } }, { projection: { id: 1, name: 1 } }).toArray(),
+    C.brands.find({ id: { $in: access.map((a) => a.brandId) } }, { projection: { id: 1, status: 1 } }).toArray(),
+    roleIds.length ? C.rolePermissions.find({ roleId: { $in: roleIds } }).toArray() : Promise.resolve([]),
+  ]);
+  const permissions = new Set(permRows.map((p) => p.permissionKey as Permission));
 
   return {
-    ...user,
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    title: user.title,
     roles: roleIds as RoleId[],
-    roleNames: roleRows.map((r) => r.name),
+    roleNames: roleIds.map((id) => roleRows.find((r) => r.id === id)?.name ?? id),
     permissions,
-    brandIds: brandRows.map((b) => b.brandId).sort(),
-    activeBrandIds: brandRows.filter((b) => b.status === "active").map((b) => b.brandId).sort(),
-    entityIds: permissions.has("entities.all_access") ? "all" : entityRows.map((e) => e.id),
+    brandIds: brandRows.map((b) => b.id).sort(),
+    activeBrandIds: brandRows.filter((b) => b.status === "active").map((b) => b.id).sort(),
+    entityIds: permissions.has("entities.all_access") ? "all" : entityRows.map((e) => e.legalEntityId),
   };
 }
 

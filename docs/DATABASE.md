@@ -1,21 +1,24 @@
 # Database schema
 
-PostgreSQL schema defined in `lib/db/schema.ts` (Drizzle ORM); migrations in
-`drizzle/`. The demo runs it on **PGlite** (PostgreSQL compiled to WASM,
-persisted in `.data/pglite`); production runs the same migrations on any
-PostgreSQL 15+ server.
+**MongoDB**, one collection per entity below (collection name = the name
+shown). Document fields, types and defaults are declared in
+`lib/db/schema.ts` (Drizzle column builders, used only as a typed schema);
+indexes live in `lib/db/indexes.ts`; the typed access layer and the
+append-only protections are in `lib/db/collections.ts`. Locally the app runs
+its own MongoDB (`.data/mongo`, a one-node replica set so transactions work);
+online it uses MongoDB Atlas via `MONGODB_URI`.
 
 ## Conventions
 
 | Concern | Rule |
 | --- | --- |
-| Identifiers | Stable, human-readable text keys minted from `id_counters`: `CUS-100001`, `SAL-200001`, `INV-300001`, `TXN-500001`, `RCB-2026-0001`, `LEAD-00001`, `ADJ-0001`, … Never reused or changed. |
+| Identifiers | Stable, human-readable string `id`s (unique index) minted from `id_counters`: `CUS-100001`, `SAL-200001`, `INV-300001`, `TXN-500001`, `RCB-2026-0001`, `LEAD-00001`, `ADJ-0001`, … Never reused or changed. |
 | Customer-facing invoice numbers | `<BRAND PREFIX>-<YEAR>-<######>` (unique index), per brand and year. |
-| Money | `numeric(14,2)` plus an explicit ISO-4217 `currency` column. App code converts to integer cents (`lib/money.ts`). |
-| Time | `timestamptz` everywhere (UTC). Mapping validity uses `date`. |
+| Money | Decimal strings (`"1234.50"`) plus an explicit ISO-4217 `currency` field. App code converts to integer cents (`lib/money.ts`); aggregations sum them exactly as Decimal128. |
+| Time | Dates (UTC) everywhere. Mapping validity uses `YYYY-MM-DD` strings. |
 | Deletion | No hard deletes of business records. Customers are merged (`merged_into_id`) or archived (`archived_at`); mappings are ended (`effective_to`); users are suspended. |
-| Append-only history | DB triggers (migration `0001_append_only_guards.sql`) block UPDATE/DELETE on `activity_logs`, `chargeback_events`, `customer_merge_history`; block DELETE on `transactions` and any change to a ledger row's money, currency, type, brand, entity, customer, invoice or date; block changes to closed chargeback cases. |
-| Checks | `invoices`: `0 ≤ amount_paid ≤ total`; `transactions.amount > 0`; `chargeback_cases.amount > 0`; duplicate pairs must reference two different customers. |
+| Append-only history | The data layer (`lib/db/collections.ts`) blocks updates/deletes on `activity_logs`, `chargeback_events`, `customer_merge_history`; block DELETE on `transactions` and any change to a ledger row's money, currency, type, brand, entity, customer, invoice or date; block changes to closed chargeback cases. |
+| Checks | Enforced by the services before writing: `0 ≤ amount_paid ≤ total`, positive ledger and case amounts, duplicate pairs reference two different customers. `npm run db:inspect` re-checks them. |
 
 ## Entity overview
 
@@ -95,11 +98,9 @@ notes, tasks, notifications, activity_logs, system_settings, id_counters
 | Intercompany recharges | Separate ledger type between two of our entities. Never revenue, never sales. |
 | Outstanding | Σ (invoice total − amount_paid − approved adjustments) for pending / partially paid / overdue invoices. |
 
-## Row-level security for production
+## Scoping
 
-The application enforces brand / LLC / ownership scope in SQL
-(`lib/auth/scope.ts`). For production, mirror these rules with PostgreSQL
-RLS: set `app.user_id` per connection (`SET LOCAL`), and add policies on
-`sales`, `invoices`, `transactions`, `chargeback_cases`, `customers` that join
-`user_brand_access` / `user_legal_entity_access`. This gives defence in depth if
-an application query is ever written without a scope.
+The application enforces brand / LLC / ownership scope in every query
+(`lib/auth/scope.ts` builds the MongoDB filters). In production, give the app
+its own Atlas database user with access to this database only, so nothing can
+bypass the scoping and the append-only rules.

@@ -1,141 +1,89 @@
 /**
- * Prepares a hosted PostgreSQL demo database for the online deployment.
+ * Loads a MongoDB database for the CRM — the hosted one (MONGODB_URI, e.g. Atlas)
+ * or, without MONGODB_URI, the local one in .data/mongo.
  *
- *   DATABASE_URL=postgres://… npm run db:setup -- --yes            copy the local demo data (.data/pglite)
- *   DATABASE_URL=postgres://… npm run db:setup -- --yes --seed     load the fresh deterministic seed instead
+ *   npm run db:setup -- --yes             copy the existing data from the old local database (.data/pglite)
+ *   npm run db:setup -- --yes --seed      load the fresh deterministic demo data instead
  *
- * 1. Applies the migrations in drizzle/ (schema + append-only triggers).
+ * 1. Creates every collection's indexes.
  * 2. Refuses to continue if the target already holds users — it never
  *    overwrites or deletes data. Use a new, empty database.
- * 3. Copies every table from the local PGlite demo database in foreign-key
- *    order (login sessions excluded) inside one transaction, then advances
- *    the serial sequences. Stop the local server first (PGlite is single-process).
+ * 3. Copies every table (login sessions excluded) into its collection inside one
+ *    transaction, keeping ids, money values and dates exactly, and continues the
+ *    numbered ids after the copied ones.
  */
-import { sql } from "drizzle-orm";
-import type { PoolClient } from "pg";
-import { createPgliteDb, createPostgresDb, migratePostgres, DATA_DIR } from "../lib/db/client";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { PGlite } from "@electric-sql/pglite";
+import { drizzle } from "drizzle-orm/pglite";
+import { connectMongo, DATA_DIR, DB_NAME, usingLocalMongo } from "../lib/db/client";
+import { collectionName, makeCollections, runTransaction, TABLES, type Collections, type TableKey } from "../lib/db/collections";
+import { ensureIndexes } from "../lib/db/indexes";
 import { seedDatabase } from "../lib/db/seed";
 
-const SKIP = new Set(["sessions"]);
+const PGLITE_DIR = process.env.CRM_PGLITE_DIR ? path.resolve(process.env.CRM_PGLITE_DIR) : path.join(process.cwd(), ".data", "pglite");
+const SKIP = new Set<TableKey>(["sessions"]);
+const SERIAL: TableKey[] = ["activityLogs", "chargebackEvents"];
 
 async function main() {
-  const url = process.env.DATABASE_URL;
-  if (!url) throw new Error("Set DATABASE_URL to the hosted demo database first.");
-  const host = new URL(url).host;
+  const target = usingLocalMongo() ? `the local database (${path.relative(process.cwd(), DATA_DIR)})` : `${new URL(process.env.MONGODB_URI!.replace(/^mongodb(\+srv)?:/, "http:")).host} / ${DB_NAME}`;
   if (!process.argv.includes("--yes")) {
-    console.log(`Target: ${host}\nThis must be a new, empty DEMO database (never production). Re-run with --yes to continue.`);
+    console.log(`Target: ${target}\nThis must be a new, empty DEMO database (never production). Re-run with --yes to continue.`);
     process.exit(1);
   }
   const seedOnly = process.argv.includes("--seed");
+  if (!seedOnly && !existsSync(PGLITE_DIR)) throw new Error(`No existing data at ${PGLITE_DIR}. Use --seed for the demo data.`);
 
-  const { db, client: pool } = await createPostgresDb(url, { max: 2 });
-  console.log(`Migrating ${host}…`);
-  await migratePostgres(db);
-  const existing = await db.execute<{ n: number }>(sql`select count(*)::int as n from users`);
-  if (existing.rows[0].n > 0) {
-    await pool.end();
-    throw new Error(`${host} already has ${existing.rows[0].n} users — nothing changed. Use an empty database.`);
-  }
-
-  if (seedOnly) {
-    await seedDatabase(db);
-    console.log("Loaded the deterministic demo seed.");
-  } else {
-    const { client: local } = await createPgliteDb(DATA_DIR);
-    const conn = await pool.connect();
-    try {
-      await copyAll(local, conn);
-    } finally {
-      conn.release();
-      await local.close();
-    }
-  }
-  const counts = await db.execute<{ t: string; n: number }>(
-    sql`select 'users' t, count(*)::int n from users union all select 'customers', count(*)::int from customers union all select 'invoices', count(*)::int from invoices union all select 'chargeback_cases', count(*)::int from chargeback_cases`,
-  );
-  console.log(counts.rows.map((r) => `${r.t}=${r.n}`).join("  "));
-  await pool.end();
-  console.log("Done. Set the same DATABASE_URL in the hosting provider's environment variables.");
-}
-
-type Local = Awaited<ReturnType<typeof createPgliteDb>>["client"];
-
-async function copyAll(local: Local, remote: PoolClient) {
-  const tables = (await local.query<{ t: string }>(`select table_name t from information_schema.tables where table_schema = 'public' and table_type = 'BASE TABLE'`)).rows
-    .map((r) => r.t)
-    .filter((t) => !SKIP.has(t));
-  const fks = (
-    await local.query<{ child: string; col: string; parent: string }>(`
-      select tc.table_name child, kcu.column_name col, ccu.table_name parent
-      from information_schema.table_constraints tc
-      join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema
-      join information_schema.constraint_column_usage ccu on ccu.constraint_name = tc.constraint_name and ccu.table_schema = tc.table_schema
-      where tc.constraint_type = 'FOREIGN KEY' and tc.table_schema = 'public'`)
-  ).rows;
-
-  // Parents before children; self-references are handled row by row below.
-  const order: string[] = [];
-  const pending = new Set(tables);
-  while (pending.size) {
-    const ready = [...pending].filter((t) => fks.every((f) => f.child !== t || f.parent === t || !pending.has(f.parent)));
-    if (!ready.length) throw new Error(`Foreign-key cycle between: ${[...pending].join(", ")}`);
-    for (const t of ready.sort()) {
-      order.push(t);
-      pending.delete(t);
-    }
-  }
-
-  await remote.query("begin");
+  const conn = await connectMongo();
   try {
-    for (const t of order) {
-      const cols = (
-        await local.query<{ c: string; type: string }>(
-          `select column_name c, data_type type from information_schema.columns where table_schema = 'public' and table_name = $1 order by ordinal_position`,
-          [t],
-        )
-      ).rows;
-      let rows = (await local.query<Record<string, unknown>>(`select * from "${t}"`)).rows;
-      const selfCols = fks.filter((f) => f.child === t && f.parent === t).map((f) => f.col);
-      if (selfCols.length) rows = selfFirst(rows, selfCols);
-      const names = cols.map((c) => `"${c.c}"`).join(", ");
-      for (const row of rows) {
-        const values = cols.map(({ c, type }) => (row[c] != null && (type === "json" || type === "jsonb") ? JSON.stringify(row[c]) : row[c]));
-        await remote.query(`insert into "${t}" (${names}) values (${cols.map((_, i) => `$${i + 1}`).join(", ")})`, values);
-      }
-      console.log(`${t.padEnd(30)} ${rows.length}`);
+    console.log(`Preparing ${target}…`);
+    await ensureIndexes(conn.db);
+    const C = makeCollections(conn.db);
+    const users = await C.users.countDocuments();
+    if (users > 0) throw new Error(`${target} already has ${users} users — nothing changed. Use an empty database.`);
+
+    if (seedOnly) {
+      await runTransaction(conn.client, () => seedDatabase(C));
+      console.log("Loaded the deterministic demo seed.");
+    } else {
+      const rows = await readPglite();
+      await runTransaction(conn.client, () => copyAll(C, rows));
     }
-    // Serial columns: continue after the copied ids.
-    const serials = (
-      await local.query<{ t: string; c: string }>(
-        `select table_name t, column_name c from information_schema.columns where table_schema = 'public' and column_default like 'nextval(%'`,
-      )
-    ).rows.filter((s) => !SKIP.has(s.t));
-    for (const s of serials) {
-      await remote.query(`select setval(pg_get_serial_sequence('"${s.t}"', '${s.c}'), coalesce((select max("${s.c}") from "${s.t}"), 0) + 1, false)`);
-    }
-    await remote.query("commit");
-  } catch (e) {
-    await remote.query("rollback");
-    throw e;
+    const counts = await Promise.all((["users", "customers", "invoices", "chargebackCases"] as const).map(async (k) => `${collectionName(k)}=${await C[k].countDocuments()}`));
+    console.log(counts.join("  "));
+  } finally {
+    await conn.close();
   }
+  console.log(usingLocalMongo() ? "Done." : "Done. Set the same MONGODB_URI in Netlify's environment variables.");
 }
 
-/** Orders rows so a row referencing another row of the same table comes after it. */
-function selfFirst(rows: Record<string, unknown>[], cols: string[]) {
-  const ids = new Set(rows.map((r) => r.id));
-  const done = new Set<unknown>();
-  const out: Record<string, unknown>[] = [];
-  let left = rows;
-  while (left.length) {
-    const next = left.filter((r) => cols.every((c) => r[c] == null || done.has(r[c]) || !ids.has(r[c])));
-    if (!next.length) throw new Error("Self-reference cycle in copied rows");
-    for (const r of next) {
-      out.push(r);
-      done.add(r.id);
+/** Reads every table through Drizzle, which maps columns and types to the document shape. */
+async function readPglite() {
+  const client = await PGlite.create(PGLITE_DIR);
+  const db = drizzle({ client, casing: "snake_case" });
+  const out = new Map<TableKey, Record<string, unknown>[]>();
+  try {
+    for (const k of Object.keys(TABLES) as TableKey[]) {
+      if (SKIP.has(k)) continue;
+      out.set(k, (await db.select().from(TABLES[k] as never)) as Record<string, unknown>[]);
     }
-    left = left.filter((r) => !next.includes(r));
+  } finally {
+    await client.close();
   }
   return out;
+}
+
+async function copyAll(C: Collections, rows: Map<TableKey, Record<string, unknown>[]>) {
+  for (const [k, list] of rows) {
+    if (!list.length) continue;
+    await (C[k] as unknown as { insertMany(d: object[]): Promise<unknown> }).insertMany(list);
+    console.log(`${collectionName(k).padEnd(30)} ${list.length}`);
+  }
+  // Numbered rows (audit log, case events) continue after the copied ids.
+  for (const k of SERIAL) {
+    const max = Math.max(0, ...(rows.get(k) ?? []).map((r) => Number(r.id)));
+    await C.idCounters.updateOne({ name: `seq:${collectionName(k)}` }, { $set: { value: max } }, { upsert: true });
+  }
 }
 
 main().catch((e) => {

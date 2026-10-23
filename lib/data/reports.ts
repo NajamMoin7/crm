@@ -1,18 +1,7 @@
 import "server-only";
-import { and, asc, count, desc, eq, gte, inArray, lte, ne, or, sql, sum } from "drizzle-orm";
-import { getDb } from "@/lib/db";
-import {
-  activityLogs,
-  brands,
-  chargebackCases,
-  customerBrandRelationships,
-  customers,
-  invoices,
-  sales,
-  salesAgents,
-  transactions,
-  users,
-} from "@/lib/db/schema";
+import type { Filter } from "mongodb";
+import { getDb, type RowOf } from "@/lib/db";
+import { contains, decStr, ids, sumDec, uniq } from "@/lib/db/query";
 import { brandFilter, scopeSales } from "@/lib/auth/scope";
 import { can, type Viewer } from "@/lib/auth/viewer";
 import type { Permission } from "@/lib/domain/permissions";
@@ -24,10 +13,10 @@ import type { CsvColumn, CsvValue } from "@/lib/csv";
 import { getAgents } from "@/lib/data/reference";
 import { customerListWhere, listDuplicateCandidates } from "@/lib/data/customers";
 import { salesListWhere } from "@/lib/data/sales";
-import { balanceSql, invoiceListWhere } from "@/lib/data/billing";
+import { invoiceListWhere } from "@/lib/data/billing";
 import { transactionWhere } from "@/lib/data/transactions";
 import { listCases, type CaseQueue } from "@/lib/data/chargebacks";
-import { caseConds, inRange, invoiceBalance, invoiceConds, OPEN_INVOICE_STATUSES, saleConds, txnConds } from "@/lib/data/metrics";
+import { all, caseConds, inRange, invoiceBalanceStages, invoiceConds, OPEN_INVOICE_STATUSES, saleConds, txnConds } from "@/lib/data/metrics";
 
 /** Hard cap for exports and report queries. */
 export const MAX_ROWS = 10_000;
@@ -129,7 +118,7 @@ export function canRunReport(viewer: Viewer, def: ReportDef) {
 
 /* ============================================================ helpers */
 
-const c = (v: string | number | null | undefined) => toCents(v ?? 0);
+const c = (v: unknown) => toCents(decStr(v));
 const NONE = "__none__";
 const validStatus = (def: ReportDef, s: string | null) => (s && def.statusOptions?.some((o) => o.value === s) ? s : null);
 const validType = (def: ReportDef, t: string | null) => (t && def.typeOptions?.some((o) => o.value === t) ? t : null);
@@ -141,8 +130,26 @@ const sumKey = (rows: ReportRow[], key: string) => rows.reduce((a, r) => a + (Nu
 
 /* ============================================================ reports */
 
+type G<K> = { _id: K; n: number; v?: unknown };
+
+async function namesOf(key: "users" | "customers", list: (string | null | undefined)[]) {
+  const C = await getDb();
+  const idList = ids(uniq(list));
+  if (key === "users") {
+    const rows = await C.users.find({ id: { $in: idList } }, { projection: { id: 1, name: 1 } }).toArray();
+    return new Map(rows.map((r) => [r.id, r.name]));
+  }
+  const rows = await C.customers.find({ id: { $in: idList } }, { projection: { id: 1, fullName: 1 } }).toArray();
+  return new Map(rows.map((r) => [r.id, r.fullName]));
+}
+
+const lookupInvoice = [
+  { $lookup: { from: "invoices", localField: "invoiceId", foreignField: "id", as: "_inv" } },
+  { $unwind: "$_inv" },
+];
+
 export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, now: Date): Promise<ReportResult> {
-  const db = await getDb();
+  const C = await getDb();
   const status = f.status === "all" ? null : (validStatus(def, f.status) ?? def.defaultStatus ?? null);
   const type = validType(def, f.type);
   // Metric helpers treat `status` as an invoice status; strip it where the report uses another vocabulary.
@@ -150,28 +157,27 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
 
   switch (def.key) {
     case "consolidated-sales": {
-      const rows = await db
-        .select({
-          id: sales.id, saleDate: sales.saleDate, brandId: sales.brandId, customerId: sales.customerId, customerName: customers.fullName,
-          agentName: users.name, legalEntityId: sales.legalEntityId, status: sales.status, subtotal: sales.subtotal, discount: sales.discount,
-          tax: sales.tax, total: sales.total, currency: sales.currency,
-        })
-        .from(sales)
-        .innerJoin(customers, eq(customers.id, sales.customerId))
-        .innerJoin(users, eq(users.id, sales.agentId))
-        .where(
-          and(
+      const list = await C.sales
+        .find(
+          all<RowOf<"sales">>(
             scopeSales(viewer, f.brand),
-            f.agent ? eq(sales.agentId, f.agent) : undefined,
-            f.entity ? eq(sales.legalEntityId, f.entity) : undefined,
-            f.customer ? eq(sales.customerId, f.customer) : undefined,
-            status ? eq(sales.status, status as never) : undefined,
-            inRange(sales.saleDate, f),
+            f.agent ? { agentId: f.agent } : undefined,
+            f.entity ? { legalEntityId: f.entity } : undefined,
+            f.customer ? { customerId: f.customer } : undefined,
+            status ? { status: status as never } : undefined,
+            inRange("saleDate", f),
           ),
+          { sort: { saleDate: -1, id: -1 }, limit: MAX_ROWS + 1 },
         )
-        .orderBy(desc(sales.saleDate), desc(sales.id))
-        .limit(MAX_ROWS + 1);
-      const out: ReportRow[] = rows.map((r) => ({ ...r, subtotal: c(r.subtotal), discount: c(r.discount), tax: c(r.tax), total: c(r.total) }));
+        .toArray();
+      const [cust, agents] = await Promise.all([namesOf("customers", list.map((r) => r.customerId)), namesOf("users", list.map((r) => r.agentId))]);
+      const out: ReportRow[] = list
+        .filter((r) => cust.has(r.customerId) && agents.has(r.agentId))
+        .map((r) => ({
+          id: r.id, saleDate: r.saleDate, brandId: r.brandId, customerId: r.customerId, customerName: cust.get(r.customerId) ?? null,
+          agentName: agents.get(r.agentId) ?? null, legalEntityId: r.legalEntityId, status: r.status,
+          subtotal: c(r.subtotal), discount: c(r.discount), tax: c(r.tax), total: c(r.total), currency: r.currency,
+        }));
       const live = out.filter((r) => r.status !== "cancelled");
       return finish(
         out,
@@ -198,21 +204,33 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
     }
 
     case "brand-sales": {
-      const ids = brandsOf(viewer, f);
-      const [s, p, r, o, cust] = await Promise.all([
-        db.select({ brandId: sales.brandId, n: count(), gross: sum(sales.total), discount: sum(sales.discount), tax: sum(sales.tax) }).from(sales).where(saleConds(viewer, mf)).groupBy(sales.brandId),
-        db.select({ brandId: transactions.brandId, v: sum(transactions.amount) }).from(transactions).where(and(txnConds(viewer, mf), eq(transactions.type, "payment"), eq(transactions.status, "succeeded"))).groupBy(transactions.brandId),
-        db.select({ brandId: transactions.brandId, v: sum(transactions.amount) }).from(transactions).where(and(txnConds(viewer, mf), eq(transactions.type, "refund"), eq(transactions.status, "succeeded"))).groupBy(transactions.brandId),
-        db.select({ brandId: invoices.brandId, v: sql<string>`sum(${invoiceBalance})` }).from(invoices).where(and(invoiceConds(viewer, mf), inArray(invoices.status, [...OPEN_INVOICE_STATUSES]))).groupBy(invoices.brandId),
-        db.select({ brandId: sales.brandId, n: sql<number>`count(distinct ${sales.customerId})`.mapWith(Number) }).from(sales).where(saleConds(viewer, mf)).groupBy(sales.brandId),
+      const brandIds = brandsOf(viewer, f);
+      const [sc, tc] = await Promise.all([saleConds(viewer, mf), txnConds(viewer, mf)]);
+      const [s, p, r, o, cust, brandRows] = await Promise.all([
+        C.sales
+          .aggregate<G<string> & { gross: unknown; discount: unknown; tax: unknown }>([
+            { $match: sc },
+            { $group: { _id: "$brandId", n: { $sum: 1 }, gross: sumDec("$total"), discount: sumDec("$discount"), tax: sumDec("$tax") } },
+          ])
+          .toArray(),
+        C.transactions.aggregate<G<string>>([{ $match: all(tc, { type: "payment", status: "succeeded" }) }, { $group: { _id: "$brandId", n: { $sum: 1 }, v: sumDec("$amount") } }]).toArray(),
+        C.transactions.aggregate<G<string>>([{ $match: all(tc, { type: "refund", status: "succeeded" }) }, { $group: { _id: "$brandId", n: { $sum: 1 }, v: sumDec("$amount") } }]).toArray(),
+        C.invoices
+          .aggregate<G<string>>([
+            { $match: all(invoiceConds(viewer, mf), { status: { $in: [...OPEN_INVOICE_STATUSES] } }) },
+            ...invoiceBalanceStages(),
+            { $group: { _id: "$brandId", n: { $sum: 1 }, v: { $sum: "$balance" } } },
+          ])
+          .toArray(),
+        C.sales.aggregate<{ _id: string; c: string[] }>([{ $match: sc }, { $group: { _id: "$brandId", c: { $addToSet: "$customerId" } } }]).toArray(),
+        C.brands.find({ id: { $in: ids(brandIds) } }, { projection: { id: 1, name: 1 } }).toArray(),
       ]);
-      const brandRows = await db.select({ id: brands.id, name: brands.name }).from(brands).where(inArray(brands.id, ids.length ? ids : [NONE]));
-      const rows: ReportRow[] = ids.map((id) => {
-        const x = s.find((q) => q.brandId === id);
+      const rows: ReportRow[] = brandIds.map((id) => {
+        const x = s.find((q) => q._id === id);
         return {
-          brandId: id, brandName: brandRows.find((b) => b.id === id)?.name ?? id, sales: x?.n ?? 0, customers: cust.find((q) => q.brandId === id)?.n ?? 0,
+          brandId: id, brandName: brandRows.find((b) => b.id === id)?.name ?? id, sales: x?.n ?? 0, customers: cust.find((q) => q._id === id)?.c.length ?? 0,
           gross: c(x?.gross), discount: c(x?.discount), tax: c(x?.tax), avg: x?.n ? Math.round(c(x.gross) / x.n) : 0,
-          collected: c(p.find((q) => q.brandId === id)?.v), refunds: c(r.find((q) => q.brandId === id)?.v), outstanding: c(o.find((q) => q.brandId === id)?.v),
+          collected: c(p.find((q) => q._id === id)?.v), refunds: c(r.find((q) => q._id === id)?.v), outstanding: c(o.find((q) => q._id === id)?.v),
         };
       });
       return finish(
@@ -240,39 +258,44 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
     }
 
     case "agent-performance": {
-      const ids = brandsOf(viewer, f);
+      const brandIds = brandsOf(viewer, f);
       const agentWhere = { ...mf, agent: null };
+      const [sc, tc, cc] = await Promise.all([saleConds(viewer, agentWhere), txnConds(viewer, agentWhere), caseConds(viewer, agentWhere)]);
       const [agents, s, p, cb] = await Promise.all([
         getAgents(),
-        db.select({ agentId: sales.agentId, n: count(), gross: sum(sales.total) }).from(sales).where(saleConds(viewer, agentWhere)).groupBy(sales.agentId),
-        db
-          .select({ agentId: invoices.agentId, v: sum(transactions.amount) })
-          .from(transactions)
-          .innerJoin(invoices, eq(invoices.id, transactions.invoiceId))
-          .where(and(txnConds(viewer, agentWhere), eq(transactions.type, "payment"), eq(transactions.status, "succeeded")))
-          .groupBy(invoices.agentId),
-        db
-          .select({
-            agentId: invoices.agentId,
-            n: count(),
-            completed: sql<string>`coalesce(sum(${chargebackCases.amount}) filter (where ${chargebackCases.status} = 'completed'), 0)`,
-          })
-          .from(chargebackCases)
-          .innerJoin(invoices, eq(invoices.id, chargebackCases.invoiceId))
-          .where(caseConds(viewer, agentWhere))
-          .groupBy(invoices.agentId),
+        C.sales.aggregate<G<string> & { gross: unknown }>([{ $match: sc }, { $group: { _id: "$agentId", n: { $sum: 1 }, gross: sumDec("$total") } }]).toArray(),
+        C.transactions
+          .aggregate<G<string>>([
+            { $match: all(tc, { type: "payment", status: "succeeded" }) },
+            ...lookupInvoice,
+            { $group: { _id: "$_inv.agentId", n: { $sum: 1 }, v: sumDec("$amount") } },
+          ])
+          .toArray(),
+        C.chargebackCases
+          .aggregate<G<string> & { completed: unknown }>([
+            { $match: cc },
+            ...lookupInvoice,
+            {
+              $group: {
+                _id: "$_inv.agentId",
+                n: { $sum: 1 },
+                completed: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, { $toDecimal: "$amount" }, { $toDecimal: "0" }] } },
+              },
+            },
+          ])
+          .toArray(),
       ]);
       const days = f.from ? Math.max(1, ((f.to ?? now).getTime() - f.from.getTime()) / 86_400_000) : null;
-      const pool = agents.filter((a) => a.brandIds.some((b) => ids.includes(b)) && (!f.agent || a.id === f.agent) && (can(viewer, "sales.view_all") || a.id === viewer.id));
+      const pool = agents.filter((a) => a.brandIds.some((b) => brandIds.includes(b)) && (!f.agent || a.id === f.agent) && (can(viewer, "sales.view_all") || a.id === viewer.id));
       const rows: ReportRow[] = pool
         .map((a) => {
-          const x = s.find((q) => q.agentId === a.id);
+          const x = s.find((q) => q._id === a.id);
           const gross = c(x?.gross);
           const target = days ? Math.round((c(a.monthlyTarget) * days) / 30.44) : null;
-          const k = cb.find((q) => q.agentId === a.id);
+          const k = cb.find((q) => q._id === a.id);
           return {
             agentId: a.id, name: a.name, code: a.agentCode, team: a.team, status: a.status, sales: x?.n ?? 0, gross,
-            avg: x?.n ? Math.round(gross / x.n) : 0, collected: c(p.find((q) => q.agentId === a.id)?.v), target,
+            avg: x?.n ? Math.round(gross / x.n) : 0, collected: c(p.find((q) => q._id === a.id)?.v), target,
             attainment: target ? gross / target : null, cbCases: k?.n ?? 0, cbCompleted: c(k?.completed),
           };
         })
@@ -303,16 +326,23 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
     }
 
     case "billing-collection": {
-      const rows = await db
-        .select({
-          brandId: invoices.brandId, status: invoices.status, n: count(), billed: sum(invoices.total), paid: sum(invoices.amountPaid),
-          due: sql<string>`coalesce(sum(${balanceSql}) filter (where ${inArray(invoices.status, [...OPEN_INVOICE_STATUSES])}), 0)`,
-        })
-        .from(invoices)
-        .where(invoiceConds(viewer, mf))
-        .groupBy(invoices.brandId, invoices.status)
-        .orderBy(asc(invoices.brandId), asc(invoices.status));
-      const out: ReportRow[] = rows.map((r) => ({ brandId: r.brandId, status: r.status, count: r.n, billed: c(r.billed), paid: c(r.paid), due: c(r.due) }));
+      const rows = await C.invoices
+        .aggregate<{ _id: { brandId: string; status: string }; n: number; billed: unknown; paid: unknown; due: unknown }>([
+          { $match: invoiceConds(viewer, mf) },
+          ...invoiceBalanceStages(),
+          {
+            $group: {
+              _id: { brandId: "$brandId", status: "$status" },
+              n: { $sum: 1 },
+              billed: sumDec("$total"),
+              paid: sumDec("$amountPaid"),
+              due: { $sum: { $cond: [{ $in: ["$status", [...OPEN_INVOICE_STATUSES]] }, "$balance", { $toDecimal: "0" }] } },
+            },
+          },
+          { $sort: { "_id.brandId": 1, "_id.status": 1 } },
+        ])
+        .toArray();
+      const out: ReportRow[] = rows.map((r) => ({ brandId: r._id.brandId, status: r._id.status, count: r.n, billed: c(r.billed), paid: c(r.paid), due: c(r.due) }));
       const billed = sumKey(out.filter((r) => r.status !== "draft" && r.status !== "cancelled"), "billed");
       return finish(
         out,
@@ -335,21 +365,28 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
     }
 
     case "outstanding-aging": {
-      const daysPast = sql<number>`greatest(0, floor(extract(epoch from (${now.toISOString()}::timestamptz - ${invoices.dueDate})) / 86400))::int`;
-      const rows = await db
-        .select({
-          id: invoices.id, invoiceNumber: invoices.invoiceNumber, brandId: invoices.brandId, customerId: invoices.customerId, customerName: customers.fullName,
-          agentName: users.name, legalEntityId: invoices.legalEntityId, status: invoices.status, billingDate: invoices.billingDate, dueDate: invoices.dueDate,
-          total: invoices.total, balance: balanceSql, days: daysPast,
-        })
-        .from(invoices)
-        .innerJoin(customers, eq(customers.id, invoices.customerId))
-        .leftJoin(users, eq(users.id, invoices.agentId))
-        .where(and(invoiceConds(viewer, { ...mf, status: null }), inArray(invoices.status, [...OPEN_INVOICE_STATUSES]), sql`${balanceSql} > 0`))
-        .orderBy(asc(invoices.dueDate))
-        .limit(MAX_ROWS + 1);
+      const list = await C.invoices
+        .aggregate<RowOf<"invoices"> & { balance: unknown }>([
+          { $match: all(invoiceConds(viewer, { ...mf, status: null }), { status: { $in: [...OPEN_INVOICE_STATUSES] } }) },
+          ...invoiceBalanceStages(),
+          { $match: { balance: { $gt: { $numberDecimal: "0" } } } },
+          { $sort: { dueDate: 1 } },
+          { $limit: MAX_ROWS + 1 },
+          { $project: { _id: 0 } },
+        ])
+        .toArray();
+      const [cust, agents] = await Promise.all([namesOf("customers", list.map((r) => r.customerId)), namesOf("users", list.map((r) => r.agentId))]);
       const bucket = (d: number) => (d <= 30 ? "0–30" : d <= 60 ? "31–60" : d <= 90 ? "61–90" : "90+");
-      const out: ReportRow[] = rows.map((r) => ({ ...r, total: c(r.total), balance: c(r.balance), bucket: bucket(r.days), notDue: r.dueDate > now ? "Not yet due" : "Past due" }));
+      const out: ReportRow[] = list
+        .filter((r) => cust.has(r.customerId))
+        .map((r) => {
+          const days = Math.max(0, Math.floor((now.getTime() - new Date(r.dueDate).getTime()) / 86_400_000));
+          return {
+            id: r.id, invoiceNumber: r.invoiceNumber, brandId: r.brandId, customerId: r.customerId, customerName: cust.get(r.customerId) ?? null,
+            agentName: agents.get(r.agentId) ?? null, legalEntityId: r.legalEntityId, status: r.status, billingDate: r.billingDate, dueDate: r.dueDate,
+            total: c(r.total), balance: c(r.balance), days, bucket: bucket(days), notDue: r.dueDate > now ? "Not yet due" : "Past due",
+          };
+        });
       const sumB = (b: string) => sumKey(out.filter((r) => r.bucket === b), "balance");
       const nB = (b: string) => out.filter((r) => r.bucket === b).length;
       return finish(
@@ -379,21 +416,24 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
 
     case "chargeback-cases": {
       const ext = can(viewer, "transactions.view");
-      const rows = await db
-        .select({
-          id: chargebackCases.id, requestDate: chargebackCases.requestDate, brandId: chargebackCases.brandId, customerId: chargebackCases.customerId,
-          customerName: customers.fullName, invoiceId: chargebackCases.invoiceId, invoiceNumber: invoices.invoiceNumber, status: chargebackCases.status,
-          origin: chargebackCases.origin, reasonCode: chargebackCases.reasonCode, amount: chargebackCases.amount,
-          agentName: users.name, externalRef: chargebackCases.externalProcessorReference, completedAt: chargebackCases.completedAt,
-        })
-        .from(chargebackCases)
-        .innerJoin(customers, eq(customers.id, chargebackCases.customerId))
-        .innerJoin(invoices, eq(invoices.id, chargebackCases.invoiceId))
-        .leftJoin(users, eq(users.id, invoices.agentId))
-        .where(and(caseConds(viewer, mf), status ? eq(chargebackCases.status, status as never) : undefined))
-        .orderBy(desc(chargebackCases.requestDate))
-        .limit(MAX_ROWS + 1);
-      const out: ReportRow[] = rows.map((r) => ({ ...r, amount: c(r.amount), externalRef: ext ? r.externalRef : r.externalRef ? maskReference(r.externalRef) : null }));
+      const list = await C.chargebackCases
+        .find(all<RowOf<"chargebackCases">>(await caseConds(viewer, mf), status ? { status: status as never } : undefined), { sort: { requestDate: -1 }, limit: MAX_ROWS + 1 })
+        .toArray();
+      const invs = await C.invoices.find({ id: { $in: ids(list.map((r) => r.invoiceId)) } }, { projection: { id: 1, invoiceNumber: 1, agentId: 1 } }).toArray();
+      const [cust, agents] = await Promise.all([namesOf("customers", list.map((r) => r.customerId)), namesOf("users", invs.map((i) => i.agentId))]);
+      const out: ReportRow[] = list.flatMap((r) => {
+        const inv = invs.find((i) => i.id === r.invoiceId);
+        if (!inv || !cust.has(r.customerId)) return [];
+        return [
+          {
+            id: r.id, requestDate: r.requestDate, brandId: r.brandId, customerId: r.customerId, customerName: cust.get(r.customerId) ?? null,
+            invoiceId: r.invoiceId, invoiceNumber: inv.invoiceNumber, status: r.status, origin: r.origin, reasonCode: r.reasonCode, amount: c(r.amount),
+            agentName: agents.get(inv.agentId) ?? null,
+            externalRef: ext ? r.externalProcessorReference : r.externalProcessorReference ? maskReference(r.externalProcessorReference) : null,
+            completedAt: r.completedAt,
+          },
+        ];
+      });
       const done = out.filter((r) => r.status === "completed");
       const open = out.filter((r) => (CASE_OPEN_STATUSES as readonly string[]).includes(String(r.status)));
       return finish(
@@ -420,12 +460,14 @@ export async function runReport(viewer: Viewer, def: ReportDef, f: ListFilters, 
     }
 
     case "recharge-status": {
-      const rows = await db
-        .select({ caseType: chargebackCases.caseType, status: chargebackCases.status, n: count(), amt: sum(chargebackCases.amount) })
-        .from(chargebackCases)
-        .where(and(caseConds(viewer, mf, { type: "any" }), type ? eq(chargebackCases.caseType, type as never) : undefined))
-        .groupBy(chargebackCases.caseType, chargebackCases.status)
-        .orderBy(asc(chargebackCases.caseType), asc(chargebackCases.status));
+      const grouped = await C.chargebackCases
+        .aggregate<{ _id: { caseType: string; status: string }; n: number; amt: unknown }>([
+          { $match: all<RowOf<"chargebackCases">>(await caseConds(viewer, mf, { type: "any" }), type ? { caseType: type as never } : undefined) },
+          { $group: { _id: { caseType: "$caseType", status: "$status" }, n: { $sum: 1 }, amt: sumDec("$amount") } },
+          { $sort: { "_id.caseType": 1, "_id.status": 1 } },
+        ])
+        .toArray();
+      const rows = grouped.map((g) => ({ caseType: g._id.caseType, status: g._id.status, n: g.n, amt: decStr(g.amt) }));
       const out: ReportRow[] = rows.map((r) => ({
         caseType: r.caseType === "chargeback" ? "Recharge / Chargeback" : "Intercompany recharge", status: r.status, count: r.n, amount: c(r.amt),
       }));
@@ -525,27 +567,27 @@ function cols(spec: [string, string, ("money" | "ref")?][], maskRefs = false): C
 }
 
 /**
- * Raw dataset exports. Each reuses the WHERE builder of the matching list
+ * Raw dataset exports. Each reuses the filter builder of the matching list
  * page, so a CSV contains exactly what the user sees in that list (all pages).
  */
 export async function buildDataset(viewer: Viewer, name: string, f: ListFilters, sp: Record<string, string | string[] | undefined>): Promise<Built> {
-  const db = await getDb();
+  const C = await getDb();
   const limit = MAX_ROWS;
   const maskRefs = !can(viewer, "transactions.view");
   switch (name) {
     case "customers": {
-      const rows = await db
-        .select({
-          id: customers.id, fullName: customers.fullName, email: customers.email, phone: customers.phone, companyName: customers.companyName,
-          country: customers.country, city: customers.city, status: customers.status, source: customers.acquisitionSource, agent: users.name,
-          brands: sql<string>`(select string_agg(${customerBrandRelationships.brandId}, ' ' order by ${customerBrandRelationships.brandId}) from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id})`,
-          createdAt: customers.createdAt, lastActivityAt: customers.lastActivityAt,
-        })
-        .from(customers)
-        .leftJoin(users, eq(users.id, customers.assignedAgentId))
-        .where(customerListWhere(viewer, f))
-        .orderBy(desc(customers.lastActivityAt), asc(customers.id))
-        .limit(limit);
+      const where = (await customerListWhere(viewer, f)) as Filter<RowOf<"customers">>;
+      const list = await C.customers.find(where, { sort: { lastActivityAt: -1, id: 1 }, limit }).toArray();
+      const [agents, rels] = await Promise.all([
+        namesOf("users", list.map((r) => r.assignedAgentId)),
+        C.customerBrandRelationships.find({ customerId: { $in: ids(list.map((r) => r.id)) } }).toArray(),
+      ]);
+      const rows = list.map((r) => ({
+        id: r.id, fullName: r.fullName, email: r.email, phone: r.phone, companyName: r.companyName, country: r.country, city: r.city,
+        status: r.status, source: r.acquisitionSource, agent: r.assignedAgentId ? (agents.get(r.assignedAgentId) ?? null) : null,
+        brands: rels.filter((x) => x.customerId === r.id).map((x) => x.brandId).sort().join(" ") || null,
+        createdAt: r.createdAt, lastActivityAt: r.lastActivityAt,
+      }));
       return {
         rows,
         columns: cols([
@@ -557,18 +599,16 @@ export async function buildDataset(viewer: Viewer, name: string, f: ListFilters,
     }
     case "sales": {
       const mine = sp.mine === "1";
-      const rows = await db
-        .select({
-          id: sales.id, saleDate: sales.saleDate, brandId: sales.brandId, customerId: sales.customerId, customerName: customers.fullName,
-          agent: users.name, legalEntityId: sales.legalEntityId, status: sales.status, currency: sales.currency, subtotal: sales.subtotal,
-          discount: sales.discount, tax: sales.tax, total: sales.total, sourceSystem: sales.sourceSystem,
-        })
-        .from(sales)
-        .innerJoin(customers, eq(customers.id, sales.customerId))
-        .leftJoin(users, eq(users.id, sales.agentId))
-        .where(salesListWhere(viewer, f, { mine }))
-        .orderBy(desc(sales.saleDate), desc(sales.id))
-        .limit(limit);
+      const where = (await salesListWhere(viewer, f, { mine })) as unknown as Filter<RowOf<"sales">>;
+      const list = await C.sales.find(where, { sort: { saleDate: -1, id: -1 }, limit }).toArray();
+      const [cust, agents] = await Promise.all([namesOf("customers", list.map((r) => r.customerId)), namesOf("users", list.map((r) => r.agentId))]);
+      const rows = list
+        .filter((r) => cust.has(r.customerId))
+        .map((r) => ({
+          id: r.id, saleDate: r.saleDate, brandId: r.brandId, customerId: r.customerId, customerName: cust.get(r.customerId) ?? null,
+          agent: agents.get(r.agentId) ?? null, legalEntityId: r.legalEntityId, status: r.status, currency: r.currency, subtotal: r.subtotal,
+          discount: r.discount, tax: r.tax, total: r.total, sourceSystem: r.sourceSystem,
+        }));
       return {
         rows,
         columns: cols([
@@ -579,20 +619,31 @@ export async function buildDataset(viewer: Viewer, name: string, f: ListFilters,
       };
     }
     case "invoices": {
-      const rows = await db
-        .select({
-          id: invoices.id, invoiceNumber: invoices.invoiceNumber, saleId: invoices.saleId, brandId: invoices.brandId, customerId: invoices.customerId,
-          customerName: customers.fullName, agent: users.name, legalEntityId: invoices.legalEntityId, billingDate: invoices.billingDate, dueDate: invoices.dueDate,
-          status: invoices.status, paymentMethod: invoices.paymentMethod, currency: invoices.currency, total: invoices.total, amountPaid: invoices.amountPaid,
-          balance: balanceSql,
-          lastRef: sql<string | null>`(select t.payment_reference from transactions t where t.invoice_id = "invoices"."id" and t.type = 'payment' order by t.occurred_at desc limit 1)`,
-        })
-        .from(invoices)
-        .innerJoin(customers, eq(customers.id, invoices.customerId))
-        .leftJoin(users, eq(users.id, invoices.agentId))
-        .where(invoiceListWhere(viewer, f))
-        .orderBy(desc(invoices.billingDate), desc(invoices.id))
-        .limit(limit);
+      const where = (await invoiceListWhere(viewer, f)) as Filter<RowOf<"invoices">>;
+      const list = await C.invoices
+        .aggregate<RowOf<"invoices"> & { balance: unknown }>([
+          { $match: where },
+          { $sort: { billingDate: -1, id: -1 } },
+          { $limit: limit },
+          ...invoiceBalanceStages(),
+          { $project: { _id: 0 } },
+        ])
+        .toArray();
+      const [cust, agents, pays] = await Promise.all([
+        namesOf("customers", list.map((r) => r.customerId)),
+        namesOf("users", list.map((r) => r.agentId)),
+        C.transactions
+          .find({ invoiceId: { $in: ids(list.map((r) => r.id)) }, type: "payment" }, { sort: { occurredAt: -1 }, projection: { invoiceId: 1, paymentReference: 1 } })
+          .toArray(),
+      ]);
+      const rows = list
+        .filter((r) => cust.has(r.customerId))
+        .map((r) => ({
+          id: r.id, invoiceNumber: r.invoiceNumber, saleId: r.saleId, brandId: r.brandId, customerId: r.customerId,
+          customerName: cust.get(r.customerId) ?? null, agent: agents.get(r.agentId) ?? null, legalEntityId: r.legalEntityId, billingDate: r.billingDate,
+          dueDate: r.dueDate, status: r.status, paymentMethod: r.paymentMethod, currency: r.currency, total: r.total, amountPaid: r.amountPaid,
+          balance: decStr(r.balance), lastRef: pays.find((t) => t.invoiceId === r.id)?.paymentReference ?? null,
+        }));
       return {
         rows,
         columns: cols(
@@ -607,22 +658,20 @@ export async function buildDataset(viewer: Viewer, name: string, f: ListFilters,
       };
     }
     case "transactions": {
-      const rows = await db
-        .select({
-          id: transactions.id, type: transactions.type, status: transactions.status, occurredAt: transactions.occurredAt, brandId: transactions.brandId,
-          customerId: transactions.customerId,
-          customerName: customers.fullName, invoiceNumber: invoices.invoiceNumber, caseId: transactions.chargebackCaseId, adjustmentId: transactions.adjustmentId,
-          currency: transactions.currency, amount: transactions.amount, method: transactions.paymentMethod, processor: transactions.processor,
-          ref: transactions.paymentReference,
-        })
-        .from(transactions)
-        .leftJoin(invoices, eq(invoices.id, transactions.invoiceId))
-        .leftJoin(customers, eq(customers.id, transactions.customerId))
-        .where(transactionWhere(viewer, f))
-        .orderBy(desc(transactions.occurredAt), desc(transactions.id))
-        .limit(limit);
+      const where = (await transactionWhere(viewer, f)) as Filter<RowOf<"transactions">>;
+      const list = await C.transactions.find(where, { sort: { occurredAt: -1, id: -1 }, limit }).toArray();
+      const [cust, invs] = await Promise.all([
+        namesOf("customers", list.map((r) => r.customerId)),
+        C.invoices.find({ id: { $in: ids(uniq(list.map((r) => r.invoiceId))) } }, { projection: { id: 1, invoiceNumber: 1 } }).toArray(),
+      ]);
       return {
-        rows: rows.map((r) => ({ ...r, revenue: r.type === "intercompany_recharge" ? "no (internal transfer)" : r.type === "payment" ? "yes" : "no" })),
+        rows: list.map((r) => ({
+          id: r.id, type: r.type, status: r.status, occurredAt: r.occurredAt, brandId: r.brandId, customerId: r.customerId,
+          customerName: r.customerId ? (cust.get(r.customerId) ?? null) : null, invoiceNumber: invs.find((i) => i.id === r.invoiceId)?.invoiceNumber ?? null,
+          caseId: r.chargebackCaseId, adjustmentId: r.adjustmentId, currency: r.currency, amount: r.amount, method: r.paymentMethod,
+          processor: r.processor, ref: r.paymentReference,
+          revenue: r.type === "intercompany_recharge" ? "no (internal transfer)" : r.type === "payment" ? "yes" : "no",
+        })),
         columns: cols(
           [
             ["Transaction ID", "id"], ["Type", "type"], ["Status", "status"], ["Occurred at", "occurredAt"], ["Brand", "brandId"],
@@ -652,29 +701,26 @@ export async function buildDataset(viewer: Viewer, name: string, f: ListFilters,
       };
     }
     case "activity": {
-      const like = f.q ? `%${f.q.replace(/[%_]/g, "")}%` : null;
-      const rows = await db
-        .select({
-          id: activityLogs.id, createdAt: activityLogs.createdAt, actor: users.name, action: activityLogs.action, entityType: activityLogs.entityType,
-          entityId: activityLogs.entityId, brandId: activityLogs.brandId, legalEntityId: activityLogs.legalEntityId, summary: activityLogs.summary, ip: activityLogs.ip,
-        })
-        .from(activityLogs)
-        .leftJoin(users, eq(users.id, activityLogs.actorId))
-        .where(
-          and(
+      const q = f.q ? f.q.replace(/[%_]/g, "") : "";
+      const list = await C.activityLogs
+        .find(
+          all<RowOf<"activityLogs">>(
             // Brand-tagged entries outside the viewer's brands are excluded; untagged system entries are kept.
-            or(sql`${activityLogs.brandId} is null`, inArray(activityLogs.brandId, brandFilter(viewer, f.brand))),
-            f.agent ? eq(activityLogs.actorId, f.agent) : undefined,
-            f.type ? eq(activityLogs.entityType, f.type) : undefined,
-            like ? or(sql`${activityLogs.action} ilike ${like}`, sql`${activityLogs.summary} ilike ${like}`, sql`${activityLogs.entityId} ilike ${like}`) : undefined,
-            f.from ? gte(activityLogs.createdAt, f.from) : undefined,
-            f.to ? lte(activityLogs.createdAt, f.to) : undefined,
+            { $or: [{ brandId: null }, { brandId: { $in: brandFilter(viewer, f.brand) } }] },
+            f.agent ? { actorId: f.agent } : undefined,
+            f.type ? { entityType: f.type } : undefined,
+            q ? { $or: [{ action: contains(q) }, { summary: contains(q) }, { entityId: contains(q) }] } : undefined,
+            inRange("createdAt", f),
           ),
+          { sort: { createdAt: -1 }, limit },
         )
-        .orderBy(desc(activityLogs.createdAt))
-        .limit(limit);
+        .toArray();
+      const actors = await namesOf("users", list.map((r) => r.actorId));
       return {
-        rows,
+        rows: list.map((r) => ({
+          id: r.id, createdAt: r.createdAt, actor: r.actorId ? (actors.get(r.actorId) ?? null) : null, action: r.action, entityType: r.entityType,
+          entityId: r.entityId, brandId: r.brandId, legalEntityId: r.legalEntityId, summary: r.summary, ip: r.ip,
+        })),
         columns: cols([
           ["Log ID", "id"], ["When", "createdAt"], ["Actor", "actor"], ["Action", "action"], ["Entity type", "entityType"], ["Entity ID", "entityId"],
           ["Brand", "brandId"], ["Summary", "summary"], ["IP", "ip"],
@@ -682,19 +728,22 @@ export async function buildDataset(viewer: Viewer, name: string, f: ListFilters,
       };
     }
     case "agents": {
-      const ids = brandFilter(viewer, f.brand);
-      const all = await getAgents();
-      const list = all.filter((a) => a.brandIds.some((b) => ids.includes(b)) && (!f.agent || a.id === f.agent) && (!f.status || a.status === f.status));
-      const stats = await db
-        .select({ agentId: sales.agentId, n: count(), gross: sum(sales.total) })
-        .from(sales)
-        .where(and(scopeSales(viewer, f.brand), ne(sales.status, "cancelled"), inRange(sales.saleDate, f)))
-        .groupBy(sales.agentId);
-      const mgr = await db.select({ userId: salesAgents.userId, hireDate: salesAgents.hireDate }).from(salesAgents);
+      const brandIds = brandFilter(viewer, f.brand);
+      const everyone = await getAgents();
+      const list = everyone.filter((a) => a.brandIds.some((b) => brandIds.includes(b)) && (!f.agent || a.id === f.agent) && (!f.status || a.status === f.status));
+      const [stats, mgr] = await Promise.all([
+        C.sales
+          .aggregate<{ _id: string; n: number; gross: unknown }>([
+            { $match: all<RowOf<"sales">>(scopeSales(viewer, f.brand), { status: { $ne: "cancelled" } }, inRange("saleDate", f)) },
+            { $group: { _id: "$agentId", n: { $sum: 1 }, gross: sumDec("$total") } },
+          ])
+          .toArray(),
+        C.salesAgents.find({}, { projection: { userId: 1, hireDate: 1 } }).toArray(),
+      ]);
       return {
         rows: list.map((a) => {
-          const s = stats.find((x) => x.agentId === a.id);
-          return { ...a, brands: a.brandIds.join(" "), hireDate: mgr.find((m) => m.userId === a.id)?.hireDate, sales: s?.n ?? 0, gross: s?.gross ?? "0" };
+          const s = stats.find((x) => x._id === a.id);
+          return { ...a, brands: a.brandIds.join(" "), hireDate: mgr.find((m) => m.userId === a.id)?.hireDate, sales: s?.n ?? 0, gross: s ? decStr(s.gross) : "0" };
         }),
         columns: cols([
           ["User ID", "id"], ["Name", "name"], ["Email", "email"], ["Agent code", "agentCode"], ["Team", "team"], ["Status", "status"], ["Brands", "brands"],
@@ -705,4 +754,3 @@ export async function buildDataset(viewer: Viewer, name: string, f: ListFilters,
   }
   throw new Error(`Unknown dataset ${name}`);
 }
-

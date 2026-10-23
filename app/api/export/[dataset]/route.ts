@@ -1,6 +1,5 @@
 import type { NextRequest } from "next/server";
 import { format } from "date-fns";
-import { getDb } from "@/lib/db";
 import { can, getViewer } from "@/lib/auth/viewer";
 import { logActivity } from "@/lib/audit";
 import { csvStream, type CsvColumn } from "@/lib/csv";
@@ -51,8 +50,7 @@ export async function GET(request: NextRequest, ctx: RouteContext<"/api/export/[
     filtersMeta = metaOf(f);
   }
 
-  const db = await getDb();
-  await logActivity(db, {
+  await logActivity({
     actorId: viewer.id,
     action: "export.csv",
     entityType: "export",

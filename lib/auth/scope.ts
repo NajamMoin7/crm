@@ -1,25 +1,16 @@
 import "server-only";
-import { and, eq, exists, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { cookies } from "next/headers";
-import {
-  chargebackCases,
-  customerBrandRelationships,
-  customers,
-  invoices,
-  sales,
-  transactions } from "@/lib/db/schema";
-import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import type { Filter } from "mongodb";
+import { getDb, type RowOf } from "@/lib/db";
+import { ids, NONE } from "@/lib/db/query";
 import { can, type Viewer } from "./viewer";
 
 /**
- * Row-level scoping. Every list/detail query composes one of these so that
- * brand, legal-entity and ownership restrictions are enforced in SQL — a user
- * cannot reach other records by editing URLs or request parameters.
- * (For production, mirror these rules with PostgreSQL row-level security.)
+ * Record-level scoping. Every list/detail query composes one of these filters
+ * so that brand, legal-entity and ownership restrictions are enforced in the
+ * database query itself — a user cannot reach other records by editing URLs or
+ * request parameters.
  */
-
-const NONE = "__none__";
-const ids = (list: string[]) => (list.length ? list : [NONE]);
 
 /** Narrow the viewer's brands by an optional requested brand (ignored if not permitted). */
 export function brandFilter(viewer: Viewer, requested?: string | null): string[] {
@@ -27,67 +18,69 @@ export function brandFilter(viewer: Viewer, requested?: string | null): string[]
   return ids(viewer.brandIds);
 }
 
-function entityCond(viewer: Viewer, col: AnyPgColumn): SQL | undefined {
-  return viewer.entityIds === "all" ? undefined : inArray(col, ids(viewer.entityIds));
+const entityIn = (viewer: Viewer) => (viewer.entityIds === "all" ? undefined : { $in: ids(viewer.entityIds) });
+
+/** Drops undefined keys so optional conditions read naturally. */
+function clean<T>(f: Record<string, unknown>): Filter<T> {
+  return Object.fromEntries(Object.entries(f).filter(([, v]) => v !== undefined)) as Filter<T>;
 }
 
-export function scopeSales(viewer: Viewer, brand?: string | null): SQL {
-  return and(
-    inArray(sales.brandId, brandFilter(viewer, brand)),
-    entityCond(viewer, sales.legalEntityId),
-    can(viewer, "sales.view_all") ? undefined : eq(sales.agentId, viewer.id),
-  )!;
+export function scopeSales(viewer: Viewer, brand?: string | null): Filter<RowOf<"sales">> {
+  return clean({
+    brandId: { $in: brandFilter(viewer, brand) },
+    legalEntityId: entityIn(viewer),
+    agentId: can(viewer, "sales.view_all") ? undefined : viewer.id,
+  });
 }
 
-export function scopeInvoices(viewer: Viewer, brand?: string | null): SQL {
-  return and(
-    inArray(invoices.brandId, brandFilter(viewer, brand)),
-    entityCond(viewer, invoices.legalEntityId),
-    can(viewer, "billing.view_all") ? undefined : eq(invoices.agentId, viewer.id),
-  )!;
+export function scopeInvoices(viewer: Viewer, brand?: string | null): Filter<RowOf<"invoices">> {
+  return clean({
+    brandId: { $in: brandFilter(viewer, brand) },
+    legalEntityId: entityIn(viewer),
+    agentId: can(viewer, "billing.view_all") ? undefined : viewer.id,
+  });
 }
 
-export function scopeTransactions(viewer: Viewer, brand?: string | null): SQL {
-  return and(inArray(transactions.brandId, brandFilter(viewer, brand)), entityCond(viewer, transactions.legalEntityId))!;
+export function scopeTransactions(viewer: Viewer, brand?: string | null): Filter<RowOf<"transactions">> {
+  return clean({ brandId: { $in: brandFilter(viewer, brand) }, legalEntityId: entityIn(viewer) });
 }
 
-export function scopeCases(viewer: Viewer, brand?: string | null): SQL {
-  const entityIds = viewer.entityIds;
-  return and(
-    inArray(chargebackCases.brandId, brandFilter(viewer, brand)),
-    entityIds === "all"
-      ? undefined
-      : or(
-          inArray(chargebackCases.originalLegalEntityId, ids(entityIds)),
-          inArray(chargebackCases.responsibleLegalEntityId, ids(entityIds)),
-        ),
-    can(viewer, "chargebacks.view_all") ? undefined : eq(chargebackCases.requestedBy, viewer.id),
-  )!;
+export function scopeCases(viewer: Viewer, brand?: string | null): Filter<RowOf<"chargebackCases">> {
+  const entities = entityIn(viewer);
+  return clean({
+    brandId: { $in: brandFilter(viewer, brand) },
+    $or: entities ? [{ originalLegalEntityId: entities }, { responsibleLegalEntityId: entities }] : undefined,
+    requestedBy: can(viewer, "chargebacks.view_all") ? undefined : viewer.id,
+  });
 }
 
 /**
  * Customers are visible when linked to one of the viewer's brands and — for
  * users without customers.view_all — assigned to them or sold to by them.
  * Merged / archived records are excluded unless `includeMerged`.
+ * (Async: brand links and sales live in their own collections.)
  */
-export function scopeCustomers(viewer: Viewer, brand?: string | null, opts: { includeMerged?: boolean } = {}): SQL {
+export async function scopeCustomers(
+  viewer: Viewer,
+  brand?: string | null,
+  opts: { includeMerged?: boolean } = {},
+): Promise<Filter<RowOf<"customers">>> {
+  const C = await getDb();
   const brandIds = brandFilter(viewer, brand);
-  const inBrands = exists(
-    sql`(select 1 from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id} and ${inArray(customerBrandRelationships.brandId, brandIds)})`,
-  );
+  const inBrands = await C.customerBrandRelationships.distinct("customerId", { brandId: { $in: brandIds } });
   // New customers aren't linked to a brand until their first sale; they show
   // up when no specific brand is selected (ownership rules still apply below).
-  const noBrandYet = sql`not exists (select 1 from ${customerBrandRelationships} where ${customerBrandRelationships.customerId} = ${customers.id})`;
-  return and(
-    brand && brand !== "all" ? inBrands : or(inBrands, noBrandYet),
-    opts.includeMerged ? undefined : isNull(customers.mergedIntoId),
-    can(viewer, "customers.view_all")
-      ? undefined
-      : or(
-          eq(customers.assignedAgentId, viewer.id),
-          exists(sql`(select 1 from ${sales} where ${sales.customerId} = ${customers.id} and ${sales.agentId} = ${viewer.id})`),
-        ),
-  )!;
+  const brandCond: Filter<RowOf<"customers">> =
+    brand && brand !== "all"
+      ? { id: { $in: ids(inBrands) } }
+      : { $or: [{ id: { $in: ids(inBrands) } }, { id: { $nin: await C.customerBrandRelationships.distinct("customerId") } }] };
+  const conds: Filter<RowOf<"customers">>[] = [brandCond];
+  if (!opts.includeMerged) conds.push({ mergedIntoId: null });
+  if (!can(viewer, "customers.view_all")) {
+    const soldTo = await C.sales.distinct("customerId", { agentId: viewer.id });
+    conds.push({ $or: [{ assignedAgentId: viewer.id }, { id: { $in: ids(soldTo) } }] });
+  }
+  return { $and: conds };
 }
 
 /* ------------------------------------------------- active brand context */

@@ -1,7 +1,6 @@
 import "server-only";
-import { asc, desc, eq, inArray } from "drizzle-orm";
 import { getDb } from "@/lib/db";
-import { integrationRuns, integrationSources, users } from "@/lib/db/schema";
+import { ids, uniq } from "@/lib/db/query";
 import { can, type Viewer } from "@/lib/auth/viewer";
 import { getAllBrands } from "@/lib/data/reference";
 
@@ -31,32 +30,16 @@ export function readSyncConfig(raw: unknown, brandCode: string): SyncConfig {
 }
 
 export async function listIntegrations(viewer: Viewer) {
-  const db = await getDb();
+  const C = await getDb();
   const list = (await getAllBrands()).filter((b) => viewer.brandIds.includes(b.id) || can(viewer, "brands.manage"));
-  const ids = list.map((b) => b.id).concat("__none__");
-  const sources = await db.select().from(integrationSources).where(inArray(integrationSources.brandId, ids)).orderBy(asc(integrationSources.id));
-  const sourceIds = sources.map((s) => s.id).concat("__none__");
-  const runs = await db
-    .select({
-      id: integrationRuns.id,
-      sourceId: integrationRuns.sourceId,
-      kind: integrationRuns.kind,
-      status: integrationRuns.status,
-      startedAt: integrationRuns.startedAt,
-      finishedAt: integrationRuns.finishedAt,
-      recordsRead: integrationRuns.recordsRead,
-      recordsImported: integrationRuns.recordsImported,
-      recordsFlagged: integrationRuns.recordsFlagged,
-      errorCount: integrationRuns.errorCount,
-      errors: integrationRuns.errors,
-      message: integrationRuns.message,
-      triggeredByName: users.name,
-    })
-    .from(integrationRuns)
-    .leftJoin(users, eq(users.id, integrationRuns.triggeredBy))
-    .where(inArray(integrationRuns.sourceId, sourceIds))
-    .orderBy(desc(integrationRuns.startedAt), desc(integrationRuns.id))
-    .limit(60);
+  const sources = await C.integrationSources.find({ brandId: { $in: ids(list.map((b) => b.id)) } }, { sort: { id: 1 } }).toArray();
+  const runRows = await C.integrationRuns
+    .find({ sourceId: { $in: ids(sources.map((x) => x.id)) } }, { sort: { startedAt: -1, id: -1 }, limit: 60 })
+    .toArray();
+  const names = new Map(
+    (await C.users.find({ id: { $in: ids(uniq(runRows.map((r) => r.triggeredBy))) } }, { projection: { id: 1, name: 1 } }).toArray()).map((u) => [u.id, u.name]),
+  );
+  const runs = runRows.map((r) => ({ ...r, triggeredByName: r.triggeredBy ? (names.get(r.triggeredBy) ?? null) : null }));
   return sources.map((s) => {
     const brand = list.find((b) => b.id === s.brandId)!;
     return { ...s, brand, config: readSyncConfig(s.config, brand.code), runs: runs.filter((r) => r.sourceId === s.id) };

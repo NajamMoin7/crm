@@ -1,9 +1,7 @@
 "use server";
 
 import { refresh } from "next/cache";
-import { and, eq } from "drizzle-orm";
-import { getDb } from "@/lib/db";
-import { customers, duplicateCandidates, notes } from "@/lib/db/schema";
+import { getDb, withTransaction } from "@/lib/db";
 import { nextId } from "@/lib/db/ids";
 import { authorize } from "@/lib/auth/viewer";
 import { getCustomerForViewer, findCustomerMatches } from "@/lib/data/customers";
@@ -80,10 +78,10 @@ export async function updateCustomerAction(id: string, raw: unknown): Promise<Ac
     }
     delete changes.phoneNormalized;
     if (Object.keys(changes).length === 0) return { ok: true, message: "No changes to save." };
-    const db = await getDb();
-    await db.transaction(async (tx) => {
-      await tx.update(customers).set({ ...patch, updatedAt: new Date() }).where(eq(customers.id, id));
-      await logActivity(tx, {
+    const C = await getDb();
+    await withTransaction(async () => {
+      await C.customers.updateOne({ id }, { $set: { ...patch, updatedAt: new Date() } });
+      await logActivity({
         actorId: viewer.id,
         action: "customer.updated",
         entityType: "customer",
@@ -105,12 +103,12 @@ export async function addCustomerNoteAction(customerId: string, raw: unknown): P
     if (input.visibility === "finance" && !can(viewer, "transactions.view")) throw new BusinessRuleError("Only a Super Admin can add restricted notes.");
     const customer = await getCustomerForViewer(viewer, customerId);
     if (!customer) throw new BusinessRuleError("Customer not found or not accessible.");
-    const db = await getDb();
-    await db.transaction(async (tx) => {
-      const id = await nextId(tx, "note");
-      await tx.insert(notes).values({ id, entityType: "customer", entityId: customerId, body: input.body, visibility: input.visibility, authorId: viewer.id });
-      await tx.update(customers).set({ lastActivityAt: new Date() }).where(eq(customers.id, customerId));
-      await logActivity(tx, { actorId: viewer.id, action: "note.added", entityType: "customer", entityId: customerId, summary: "Internal note added" });
+    const C = await getDb();
+    await withTransaction(async () => {
+      const id = await nextId("note");
+      await C.notes.insertOne({ id, entityType: "customer", entityId: customerId, body: input.body, visibility: input.visibility, authorId: viewer.id });
+      await C.customers.updateOne({ id: customerId }, { $set: { lastActivityAt: new Date() } });
+      await logActivity({ actorId: viewer.id, action: "note.added", entityType: "customer", entityId: customerId, summary: "Internal note added" });
     });
     refresh();
     return { ok: true, message: "Note added." };
@@ -121,13 +119,13 @@ export async function mergeDuplicateAction(candidateId: string, survivorId: stri
   return runAction(async () => {
     const viewer = await authorize("customers.merge");
     if (reason.trim().length < 5) throw new BusinessRuleError("Explain why these records are the same customer (min. 5 characters).");
-    const db = await getDb();
-    const [cand] = await db.select().from(duplicateCandidates).where(eq(duplicateCandidates.id, candidateId));
+    const C = await getDb();
+    const cand = await C.duplicateCandidates.findOne({ id: candidateId });
     if (!cand) throw new BusinessRuleError("Candidate not found.");
     for (const cid of [cand.customerAId, cand.customerBId]) {
       if (!(await getCustomerForViewer(viewer, cid))) throw new BusinessRuleError("You don't have access to both records.");
     }
-    const res = await db.transaction((tx) => mergeCustomers(tx, viewer, candidateId, survivorId, reason.trim()));
+    const res = await withTransaction(() => mergeCustomers(viewer, candidateId, survivorId, reason.trim()));
     refresh();
     return { ok: true, message: `Merged ${res.mergedId} into ${res.survivorId}.` };
   });
@@ -137,20 +135,19 @@ export async function dismissDuplicateAction(candidateId: string, note: string):
   return runAction(async () => {
     const viewer = await authorize("customers.merge");
     if (note.trim().length < 3) throw new BusinessRuleError("Add a short note explaining why these are different customers.");
-    const db = await getDb();
-    await db.transaction(async (tx) => {
-      const res = await tx
-        .update(duplicateCandidates)
-        .set({ status: "dismissed", reviewedBy: viewer.id, reviewedAt: new Date(), resolutionNote: note.trim() })
-        .where(and(eq(duplicateCandidates.id, candidateId), eq(duplicateCandidates.status, "open")))
-        .returning();
-      if (!res.length) throw new BusinessRuleError("This candidate is no longer open.");
-      await logActivity(tx, {
+    const C = await getDb();
+    await withTransaction(async () => {
+      const res = await C.duplicateCandidates.findOneAndUpdate(
+        { id: candidateId, status: "open" },
+        { $set: { status: "dismissed", reviewedBy: viewer.id, reviewedAt: new Date(), resolutionNote: note.trim() } },
+      );
+      if (!res) throw new BusinessRuleError("This candidate is no longer open.");
+      await logActivity({
         actorId: viewer.id,
         action: "customer.duplicate_dismissed",
         entityType: "customer",
-        entityId: res[0].customerAId,
-        summary: `Marked ${res[0].customerAId} and ${res[0].customerBId} as different customers`,
+        entityId: res.customerAId,
+        summary: `Marked ${res.customerAId} and ${res.customerBId} as different customers`,
         metadata: { candidateId, note: note.trim() },
       });
     });

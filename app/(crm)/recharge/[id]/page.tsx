@@ -16,7 +16,6 @@ import { getCaseDetail } from "@/lib/data/chargebacks";
 import { getBrandMap } from "@/lib/data/reference";
 import { availableActions, STAGES, TERMINAL, type CaseStatus } from "@/lib/domain/chargeback-workflow";
 import { readPolicy } from "@/lib/services/chargebacks";
-import { getDb } from "@/lib/db";
 import { CASE_STATUS, INVOICE_STATUS, PAYMENT_METHOD, REASON_CODES } from "@/lib/domain/vocab";
 import { formatCents, formatMoney, toCents } from "@/lib/money";
 import { fmtDate, fmtDateTime } from "@/lib/format";
@@ -53,7 +52,7 @@ export default async function CasePage(props: PageProps<"/recharge/[id]">) {
   if (!detail) return <AccessDenied message="This case does not exist or is outside your brands or ownership scope." />;
 
   const { case: c, events, original, invoice, customer, ledger, balance, siblings } = detail;
-  const [brandMap, policy] = await Promise.all([getBrandMap(), getDb().then(readPolicy)]);
+  const [brandMap, policy] = await Promise.all([getBrandMap(), readPolicy()]);
   const actions = availableActions(viewer, c, policy);
   const reason = REASON_CODES.find((r) => r.code === c.reasonCode);
   const showRef = can(viewer, "transactions.view");

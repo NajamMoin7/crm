@@ -1,6 +1,5 @@
 import "server-only";
-import type { DbOrTx } from "@/lib/db";
-import { activityLogs, notifications } from "@/lib/db/schema";
+import { getDb } from "@/lib/db";
 import { nextId } from "@/lib/db/ids";
 import { requestMeta } from "@/lib/auth/session";
 
@@ -16,18 +15,19 @@ type Activity = {
   metadata?: Record<string, unknown>;
 };
 
-/** Appends to the immutable audit trail. Call inside the same DB transaction as the change. */
-export async function logActivity(db: DbOrTx, entry: Activity) {
+/** Appends to the immutable audit trail. Call inside the same transaction as the change. */
+export async function logActivity(entry: Activity) {
   const { ip } = await requestMeta().catch(() => ({ ip: null }));
-  await db.insert(activityLogs).values({ ...entry, ip });
+  const C = await getDb();
+  await C.activityLogs.insertOne({ ...entry, ip });
 }
 
 export async function notify(
-  db: DbOrTx,
   userIds: string[],
   n: { kind: string; title: string; body: string; href?: string },
 ) {
+  const C = await getDb();
   for (const userId of new Set(userIds)) {
-    await db.insert(notifications).values({ id: await nextId(db, "notification"), userId, ...n });
+    await C.notifications.insertOne({ id: await nextId("notification"), userId, ...n });
   }
 }
