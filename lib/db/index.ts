@@ -1,7 +1,7 @@
 import "server-only";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { count } from "drizzle-orm";
-import { createPgliteDb, type DB } from "./client";
+import { createPgliteDb, createPostgresDb, usingPostgres, type DB } from "./client";
 import { users } from "./schema";
 import { seedDatabase } from "./seed";
 
@@ -25,9 +25,11 @@ const globalForDb = globalThis as unknown as {
 const txStore = (globalForDb.__crmTxStore ??= new AsyncLocalStorage<DB>());
 
 async function init(): Promise<DB> {
-  const { db } = await createPgliteDb();
+  // Hosted Postgres is migrated and loaded ahead of time (`npm run db:setup`).
+  const { db } = usingPostgres() ? await createPostgresDb() : await createPgliteDb();
   const [{ n }] = await db.select({ n: count() }).from(users);
   if (n === 0) {
+    if (usingPostgres()) throw new Error("The database has no users. Run `npm run db:setup` against DATABASE_URL first.");
     console.log("[crm] Empty demo database — seeding fictional demo data…");
     await seedDatabase(db);
     console.log("[crm] Demo data ready.");

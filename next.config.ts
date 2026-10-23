@@ -9,6 +9,8 @@ const nextConfig: NextConfig = {
   // PGlite ships WASM + data files resolved relative to the package; keep it out of the bundle.
   serverExternalPackages: ["@electric-sql/pglite"],
   poweredByHeader: false,
+  // Old URL: accounts are managed on the Agents page.
+  redirects: async () => [{ source: "/admin/users/:path*", destination: "/admin/agents/:path*", permanent: false }],
   turbopack: {
     rules: {
       "*.css": {

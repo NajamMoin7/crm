@@ -1,0 +1,9 @@
+# Netlify builds this Next.js app with its Next.js runtime (installed automatically).
+# Set DATABASE_URL under Site configuration → Environment variables before deploying;
+# load the database once with `npm run db:setup` (see README → Deploying online).
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "20"

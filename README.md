@@ -20,12 +20,37 @@ npm run dev            # http://localhost:3000 — the first start seeds the dem
 
 | Script | Purpose |
 | --- | --- |
-| `npm run db:reset` | Delete and re-create the demo database from the deterministic seed. Stop the dev server first (PGlite locks `.data/pglite`). Set `CRM_DATA_DIR` to use a separate copy, e.g. for tests while another server runs. |
+| `npm run db:setup -- --yes` | One-time load of a hosted Postgres demo database (`DATABASE_URL`): migrations plus a copy of the local data. See *Deploying online*. |
+| `npm run db:reset` | Delete and re-create the local demo database from the deterministic seed. Stop the dev server first (PGlite locks `.data/pglite`). Set `CRM_DATA_DIR` to use a separate copy, e.g. for tests while another server runs. |
 | `npm run db:inspect` | Integrity checks: two roles only, valid relationships, chargeback caps, append-only guards. |
 | `npx tsx scripts/migrate-roles.ts` | For an **existing non-demo** database only: dry-run of the two-role migration (`--apply` to run). See below. |
 | `npm run typecheck` / `npm run lint` | TypeScript / ESLint. |
 | `npm run test:unit` | Money math, workflow state machine, role catalogue, filters, masking, paste-details parser. |
 | `npm run test:e2e` | Browser suites against a running dev server on port 3100 (`CRM_URL` to override), using your installed Chrome/Edge. |
+
+## Deploying online (Netlify + hosted Postgres)
+
+Netlify can't keep the local `.data/pglite` files, so the online copy uses a
+hosted PostgreSQL **demo** database (Neon or Supabase, free tier is enough).
+Locally nothing changes: without `DATABASE_URL` the app keeps using PGlite.
+
+1. Create a new, empty Postgres database and copy its connection string
+   (with Neon, use the *pooled* string; it ends in `?sslmode=require`).
+2. Stop the local server, then load the database once from your machine.
+   This applies the migrations and copies the local demo data, excluding
+   login sessions. It refuses to run if the target already has users:
+   ```powershell
+   $env:DATABASE_URL = "postgres://…"
+   npm run db:setup -- --yes          # or --seed for the fresh demo data
+   Remove-Item Env:DATABASE_URL
+   ```
+3. In Netlify, open **Site configuration → Environment variables**, add
+   `DATABASE_URL` with the same value, then deploy from Git. Netlify reads
+   `netlify.toml`. Dragging the folder onto Netlify Drop can't work, because
+   this app needs a server.
+
+Keep the connection string out of Git: `.env*` files are ignored, and
+`.env.example` shows the format.
 
 ## Roles
 
