@@ -66,7 +66,17 @@ export function mongoHost(uri: string): string {
 export async function connectMongo(): Promise<Connection> {
   const uri = process.env.MONGODB_URI ? normalizeMongoUri(process.env.MONGODB_URI) : undefined;
   if (uri) {
-    const client = await MongoClient.connect(uri, clientOptions);
+    let client: MongoClient;
+    try {
+      client = new MongoClient(uri, clientOptions);
+    } catch (err) {
+      // Name what was read as the server address (never the password) so a bad value is easy to spot.
+      throw new Error(
+        `MONGODB_URI is not a valid connection string (${(err as Error).message}). Server address read as "${mongoHost(uri)}"; ` +
+          'expected the Atlas form "mongodb+srv://USER:PASSWORD@cluster0.xxxxx.mongodb.net/" with nothing else around it.',
+      );
+    }
+    await client.connect();
     return { client, db: client.db(DB_NAME), close: () => client.close() };
   }
   if (process.env.NODE_ENV === "production" && process.env.NETLIFY) {
