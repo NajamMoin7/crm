@@ -26,8 +26,45 @@ export type Connection = { client: MongoClient; db: Db; close: () => Promise<voi
 
 const clientOptions = { maxPoolSize: 5, serverSelectionTimeoutMS: 10_000 } as const;
 
+/**
+ * Percent-encodes the user name and password of a connection string, so a
+ * password containing @ : / ? # % (common in generated passwords) still works.
+ * Already-encoded values are left as they are.
+ */
+export function normalizeMongoUri(uri: string): string {
+  const m = /^(mongodb(?:\+srv)?:\/\/)(.*)$/.exec(uri.trim());
+  if (!m) throw new Error('The MongoDB connection string must start with "mongodb+srv://" or "mongodb://".');
+  const rest = m[2];
+  // The host list follows the LAST "@" before the first "/" after it.
+  const slash = rest.indexOf("/", rest.lastIndexOf("@") + 1);
+  const authority = slash < 0 ? rest : rest.slice(0, slash);
+  const tail = slash < 0 ? "" : rest.slice(slash);
+  const at = authority.lastIndexOf("@");
+  if (at < 0) return m[1] + rest;
+  const creds = authority.slice(0, at);
+  const colon = creds.indexOf(":");
+  const enc = (s: string) => {
+    let raw = s;
+    try {
+      raw = decodeURIComponent(s);
+    } catch {
+      /* not encoded */
+    }
+    return encodeURIComponent(raw);
+  };
+  const user = colon < 0 ? creds : creds.slice(0, colon);
+  const pass = colon < 0 ? null : creds.slice(colon + 1);
+  return `${m[1]}${enc(user)}${pass === null ? "" : `:${enc(pass)}`}@${authority.slice(at + 1)}${tail}`;
+}
+
+/** Host part of a connection string, for messages (never includes the password). */
+export function mongoHost(uri: string): string {
+  const rest = uri.replace(/^mongodb(\+srv)?:\/\//, "");
+  return rest.slice(rest.lastIndexOf("@") + 1).split(/[/?]/)[0];
+}
+
 export async function connectMongo(): Promise<Connection> {
-  const uri = process.env.MONGODB_URI;
+  const uri = process.env.MONGODB_URI ? normalizeMongoUri(process.env.MONGODB_URI) : undefined;
   if (uri) {
     const client = await MongoClient.connect(uri, clientOptions);
     return { client, db: client.db(DB_NAME), close: () => client.close() };

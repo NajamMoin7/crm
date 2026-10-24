@@ -2,8 +2,10 @@
  * Loads a MongoDB database for the CRM — the hosted one (MONGODB_URI, e.g. Atlas)
  * or, without MONGODB_URI, the local one in .data/mongo.
  *
- *   npm run db:setup -- --yes             copy the existing data from the old local database (.data/pglite)
- *   npm run db:setup -- --yes --seed      load the fresh deterministic demo data instead
+ *   npm run db:setup -- --yes --uri "mongodb+srv://…"           copy the existing data (old local database, .data/pglite) into Atlas
+ *   npm run db:setup -- --yes --uri "mongodb+srv://…" --seed    load the fresh deterministic demo data instead
+ *   npm run db:setup -- --yes --local                            load the local database (.data/mongo)
+ *   (MONGODB_URI in the environment works instead of --uri.)
  *
  * 1. Creates every collection's indexes.
  * 2. Refuses to continue if the target already holds users — it never
@@ -16,7 +18,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
-import { connectMongo, DATA_DIR, DB_NAME, usingLocalMongo } from "../lib/db/client";
+import { connectMongo, DATA_DIR, DB_NAME, mongoHost, usingLocalMongo } from "../lib/db/client";
 import { collectionName, makeCollections, runTransaction, TABLES, type Collections, type TableKey } from "../lib/db/collections";
 import { ensureIndexes } from "../lib/db/indexes";
 import { seedDatabase } from "../lib/db/seed";
@@ -26,7 +28,20 @@ const SKIP = new Set<TableKey>(["sessions"]);
 const SERIAL: TableKey[] = ["activityLogs", "chargebackEvents"];
 
 async function main() {
-  const target = usingLocalMongo() ? `the local database (${path.relative(process.cwd(), DATA_DIR)})` : `${new URL(process.env.MONGODB_URI!.replace(/^mongodb(\+srv)?:/, "http:")).host} / ${DB_NAME}`;
+  // `--uri <connection string>` works in any terminal (no environment variable syntax to get wrong).
+  const uriArg = process.argv[process.argv.indexOf("--uri") + 1];
+  if (process.argv.includes("--uri")) {
+    if (!uriArg || !/^mongodb(\+srv)?:\/\//.test(uriArg)) throw new Error('--uri needs a connection string starting with "mongodb+srv://" (in quotes).');
+    process.env.MONGODB_URI = uriArg;
+  }
+  // Loading the local database must be asked for explicitly, so a missing
+  // connection string never silently fills the wrong database.
+  if (usingLocalMongo() && !process.argv.includes("--local")) {
+    throw new Error(
+      'No hosted database given. Run:  npm run db:setup -- --yes --uri "mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/"\n(or add --local to load the local database in .data/mongo instead).',
+    );
+  }
+  const target = usingLocalMongo() ? `the local database (${path.relative(process.cwd(), DATA_DIR)})` : `${mongoHost(process.env.MONGODB_URI!)} / ${DB_NAME}`;
   if (!process.argv.includes("--yes")) {
     console.log(`Target: ${target}\nThis must be a new, empty DEMO database (never production). Re-run with --yes to continue.`);
     process.exit(1);

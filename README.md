@@ -21,7 +21,7 @@ npm run dev            # http://localhost:3000 — the first start downloads Mon
 
 | Script | Purpose |
 | --- | --- |
-| `npm run db:setup -- --yes` | One-time load of an empty MongoDB (`MONGODB_URI`, or the local one): indexes plus a copy of the existing data from the old local database (`.data/pglite`), or `--seed` for fresh demo data. See *Deploying online*. |
+| `npm run db:setup -- --yes --uri "…"` | One-time load of an empty MongoDB (Atlas via `--uri` / `MONGODB_URI`, or the local one with `--local`): indexes plus a copy of the existing data from the old local database (`.data/pglite`), or `--seed` for fresh demo data. See *Deploying online*. |
 | `npm run db:reset` | Delete and re-create the **local** demo database from the deterministic seed. Works while `npm run dev` runs. Refuses when `MONGODB_URI` is set. `CRM_DATA_DIR` + `CRM_MONGO_PORT` select a separate local copy (used by the tests). |
 | `npm run db:inspect` | Integrity checks: two roles only, valid relationships, chargeback caps, and that the append-only protections refuse changes. |
 | `npm run typecheck` / `npm run lint` | TypeScript / ESLint. |
@@ -40,11 +40,12 @@ database (the free M0 cluster is enough). Locally nothing changes: without
 2. Load it once from your machine. This creates the indexes and copies the
    existing data, excluding login sessions. It refuses to run if the target
    already has users:
-   ```powershell
-   $env:MONGODB_URI = "mongodb+srv://…"
-   npm run db:setup -- --yes          # or --seed for the fresh demo data
-   Remove-Item Env:MONGODB_URI
+   ```bash
+   npm run db:setup -- --yes --uri "mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/"
+   # add --seed for the fresh demo data instead of a copy
    ```
+   It prints the target it is loading; without `--uri` (or `MONGODB_URI`) it
+   refuses, unless you add `--local` to load the local database.
 3. In Netlify, open **Site configuration → Environment variables**, add
    `MONGODB_URI` with the same value, then deploy from Git (Netlify reads
    `netlify.toml`). Dragging the folder onto Netlify Drop can't work, because
